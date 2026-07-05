@@ -400,6 +400,34 @@ async fn attaches_anthropic_provider_headers() {
 }
 
 #[tokio::test]
+async fn forwards_client_identity_headers() {
+    let client = Arc::new(RecordingClient::default());
+    let state = GatewayState::from_config_with_upstream(config(), client.clone()).unwrap();
+    let app = build_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/messages")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .header("user-agent", "claude-cli/2.1.181")
+                .header("x-stainless-arch", "arm64")
+                .header("x-app", "cli")
+                .header("x-random-unlisted", "should-be-dropped")
+                .body(Body::from(r#"{"model":"claude-test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = client.last_request();
+    assert_eq!(request.headers["user-agent"], "claude-cli/2.1.181");
+    assert_eq!(request.headers["x-stainless-arch"], "arm64");
+    assert_eq!(request.headers["x-app"], "cli");
+    assert!(request.headers.get("x-random-unlisted").is_none());
+}
+
+#[tokio::test]
 async fn forwards_streaming_bytes_without_rewriting() {
     let client = Arc::new(RecordingClient::with_body(
         "event: message\ndata: {\"x\":1}\n\n",

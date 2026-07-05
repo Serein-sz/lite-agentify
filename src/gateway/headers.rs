@@ -56,7 +56,12 @@ pub(super) fn is_response_header_forwardable(name: &HeaderName) -> bool {
 fn is_request_header_forwardable(name: &HeaderName) -> bool {
     matches!(*name, ACCEPT | CONTENT_TYPE)
         || name.as_str().eq_ignore_ascii_case("anthropic-beta")
+        || name.as_str().eq_ignore_ascii_case("anthropic-dangerous-direct-browser-access")
         || name.as_str().eq_ignore_ascii_case("openai-organization")
         || name.as_str().eq_ignore_ascii_case("openai-project")
+        || name.as_str().eq_ignore_ascii_case("user-agent")
+        || name.as_str().eq_ignore_ascii_case("x-app")
+        || name.as_str().eq_ignore_ascii_case("x-claude-code-session-id")
         || name.as_str().eq_ignore_ascii_case("x-request-id")
+        || name.as_str().starts_with("x-stainless-")
 }
