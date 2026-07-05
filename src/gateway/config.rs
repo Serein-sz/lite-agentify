@@ -11,7 +11,7 @@ use super::model::{Protocol, default_listen_addr};
 
 const CONFIG_ENV_VAR: &str = "LITE_AGENTIFY_GATEWAY_CONFIG";
 const CONFIG_DIR_NAME: &str = ".config/lite-agentify";
-const CONFIG_FILE_NAME: &str = "llm-gateway.toml";
+const CONFIG_FILE_NAME: &str = "lite-agentify.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
@@ -38,7 +38,7 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteConfig {
     pub path_prefix: String,
-    pub provider: String,
+    pub providers: Vec<String>,
     #[serde(default)]
     pub model_prefix: Option<String>,
 }

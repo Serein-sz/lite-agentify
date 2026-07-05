@@ -31,9 +31,8 @@ pub(super) struct Provider {
 #[derive(Clone)]
 pub(super) struct Route {
     pub path_prefix: String,
-    pub provider_id: String,
+    pub provider_ids: Vec<String>,
     pub model_prefix: Option<String>,
-    pub protocol: Protocol,
 }
 
 pub(super) fn default_listen_addr() -> SocketAddr {

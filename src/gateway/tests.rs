@@ -1,12 +1,15 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
     body::{Body, Bytes, to_bytes},
     http::{
-        HeaderMap, HeaderValue, Request as HttpRequest, StatusCode,
+        HeaderMap, HeaderValue, Request as HttpRequest, Response, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
 };
@@ -63,6 +66,102 @@ impl UpstreamClient for RecordingClient {
     }
 }
 
+/// One scripted upstream outcome per call, consumed in order.
+enum Outcome {
+    Status(StatusCode),
+    TransportError,
+}
+
+/// Upstream client that replays a fixed script of outcomes, recording the
+/// upstream URI of every call so tests can assert which provider was contacted.
+struct ScriptedClient {
+    outcomes: Mutex<VecDeque<Outcome>>,
+    uris: Mutex<Vec<String>>,
+    calls: AtomicUsize,
+}
+
+impl ScriptedClient {
+    fn new(outcomes: impl IntoIterator<Item = Outcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
+            uris: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn uris(&self) -> Vec<String> {
+        self.uris.lock().unwrap().clone()
+    }
+}
+
+impl UpstreamClient for ScriptedClient {
+    fn send(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.uris.lock().unwrap().push(request.uri.to_string());
+        let outcome = self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("ScriptedClient received more calls than scripted outcomes");
+
+        Box::pin(async move {
+            match outcome {
+                Outcome::TransportError => Err(anyhow::anyhow!("simulated transport error")),
+                Outcome::Status(status) => Ok(UpstreamResponse {
+                    status,
+                    headers: HeaderMap::new(),
+                    body: Body::from("{}"),
+                }),
+            }
+        })
+    }
+}
+
+/// Config with a single OpenAI-compatible route whose chain is `[primary, fallback]`.
+fn failover_config() -> GatewayConfig {
+    GatewayConfig {
+        listen_addr: default_listen_addr(),
+        gateway_keys: vec!["gw-secret".to_owned()],
+        providers: vec![
+            ProviderConfig {
+                id: "primary".to_owned(),
+                protocol: Protocol::OpenAi,
+                base_url: "http://primary.test".to_owned(),
+                api_key: "primary-secret".to_owned(),
+                anthropic_version: None,
+            },
+            ProviderConfig {
+                id: "fallback".to_owned(),
+                protocol: Protocol::OpenAi,
+                base_url: "http://fallback.test".to_owned(),
+                api_key: "fallback-secret".to_owned(),
+                anthropic_version: None,
+            },
+        ],
+        routes: vec![RouteConfig {
+            path_prefix: "/v1/chat/completions".to_owned(),
+            providers: vec!["primary".to_owned(), "fallback".to_owned()],
+            model_prefix: None,
+        }],
+    }
+}
+
+async fn send_chat(app: axum::Router) -> Response<Body> {
+    app.oneshot(
+        HttpRequest::post("/v1/chat/completions")
+            .header(AUTHORIZATION, "Bearer gw-secret")
+            .body(Body::from(r#"{"model":"gpt-test"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
 fn config() -> GatewayConfig {
     GatewayConfig {
         listen_addr: default_listen_addr(),
@@ -86,12 +185,12 @@ fn config() -> GatewayConfig {
         routes: vec![
             RouteConfig {
                 path_prefix: "/v1/chat/completions".to_owned(),
-                provider: "openai".to_owned(),
+                providers: vec!["openai".to_owned()],
                 model_prefix: None,
             },
             RouteConfig {
                 path_prefix: "/v1/messages".to_owned(),
-                provider: "anthropic".to_owned(),
+                providers: vec!["anthropic".to_owned()],
                 model_prefix: None,
             },
         ],
@@ -127,7 +226,7 @@ fn skips_routes_for_missing_providers() {
 fn fails_when_no_routes_reference_configured_providers() {
     let mut config = config();
     for route in &mut config.routes {
-        route.provider = "missing".to_owned();
+        route.providers = vec!["missing".to_owned()];
     }
 
     assert!(GatewayState::from_config(config).is_err());
@@ -156,20 +255,20 @@ fn matches_model_prefix_route() {
         0,
         RouteConfig {
             path_prefix: "/v1/chat/completions".to_owned(),
-            provider: "deepseek".to_owned(),
+            providers: vec!["deepseek".to_owned()],
             model_prefix: Some("deepseek-".to_owned()),
         },
     );
 
     let state = GatewayState::from_config(config).unwrap();
-    let (_, provider) = state
+    let route = state
         .match_route(
             "/v1/chat/completions",
             br#"{"model":"deepseek-chat","messages":[]}"#,
         )
         .unwrap();
 
-    assert_eq!(provider.id, "deepseek");
+    assert_eq!(route.provider_ids, vec!["deepseek".to_owned()]);
 }
 
 #[tokio::test]
@@ -337,4 +436,116 @@ async fn healthz_works_without_authentication() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn primary_success_skips_fallback() {
+    let client = Arc::new(ScriptedClient::new([Outcome::Status(StatusCode::OK)]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 1);
+    assert_eq!(
+        client.uris(),
+        vec!["http://primary.test/v1/chat/completions".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn primary_transport_error_fails_over_to_fallback() {
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::TransportError,
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 2);
+    assert_eq!(
+        client.uris(),
+        vec![
+            "http://primary.test/v1/chat/completions".to_owned(),
+            "http://fallback.test/v1/chat/completions".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn primary_server_error_fails_over_to_fallback() {
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::BAD_GATEWAY),
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 2);
+}
+
+#[tokio::test]
+async fn client_error_is_forwarded_without_failover() {
+    let client = Arc::new(ScriptedClient::new([Outcome::Status(
+        StatusCode::BAD_REQUEST,
+    )]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(client.calls(), 1);
+}
+
+#[tokio::test]
+async fn rate_limit_is_forwarded_without_failover() {
+    let client = Arc::new(ScriptedClient::new([Outcome::Status(
+        StatusCode::TOO_MANY_REQUESTS,
+    )]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(client.calls(), 1);
+}
+
+#[tokio::test]
+async fn exhausted_chain_returns_gateway_error() {
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::INTERNAL_SERVER_ERROR),
+        Outcome::TransportError,
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(client.calls(), 2);
+}
+
+#[test]
+fn mixed_protocol_chain_fails_startup() {
+    let mut config = failover_config();
+    // Make the fallback a different protocol than the primary.
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "fallback")
+        .unwrap()
+        .protocol = Protocol::Anthropic;
+
+    assert!(GatewayState::from_config(config).is_err());
+}
+
+#[test]
+fn empty_provider_chain_fails_startup() {
+    let mut config = failover_config();
+    config.routes[0].providers.clear();
+
+    assert!(GatewayState::from_config(config).is_err());
 }

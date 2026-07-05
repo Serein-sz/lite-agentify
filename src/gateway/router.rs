@@ -61,74 +61,104 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
         }
     };
 
-    let Some((_route, provider)) = state.match_route(&path, &body) else {
+    let Some(route) = state.match_route(&path, &body) else {
         warn!(%request_id, %path, "no gateway route matched");
         return (StatusCode::NOT_FOUND, "no matching gateway route").into_response();
     };
 
-    let upstream_uri = match upstream_uri(provider, &path, query.as_deref()) {
-        Ok(uri) => uri,
-        Err(error) => {
-            warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build upstream URI");
-            return (StatusCode::BAD_GATEWAY, "failed to build upstream URI").into_response();
-        }
-    };
+    let mut last_error: Option<Response> = None;
 
-    let headers = match outbound_headers(&original_headers, provider) {
-        Ok(headers) => headers,
-        Err(error) => {
-            warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build outbound headers");
-            return (StatusCode::BAD_GATEWAY, "failed to build outbound headers").into_response();
-        }
-    };
+    for provider_id in &route.provider_ids {
+        let Some(provider) = state.provider(provider_id) else {
+            // from_config guarantees every id resolves; skip defensively.
+            continue;
+        };
 
-    let result = state
-        .upstream
-        .send(UpstreamRequest {
-            method,
-            uri: upstream_uri,
-            headers,
-            body,
-        })
-        .await;
-
-    match result {
-        Ok(upstream) => {
-            let status = upstream.status;
-            let mut response = Response::builder().status(status);
-            for (name, value) in upstream.headers.iter() {
-                if is_response_header_forwardable(name) {
-                    response = response.header(name, value);
-                }
+        let upstream_uri = match upstream_uri(provider, &path, query.as_deref()) {
+            Ok(uri) => uri,
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build upstream URI");
+                last_error =
+                    Some((StatusCode::BAD_GATEWAY, "failed to build upstream URI").into_response());
+                continue;
             }
+        };
 
-            info!(
-                %request_id,
-                provider = %provider.id,
-                protocol = %provider.protocol,
-                %path,
-                status = status.as_u16(),
-                latency_ms = started_at.elapsed().as_millis(),
-                "proxied llm request"
-            );
+        let headers = match outbound_headers(&original_headers, provider) {
+            Ok(headers) => headers,
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build outbound headers");
+                last_error = Some(
+                    (StatusCode::BAD_GATEWAY, "failed to build outbound headers").into_response(),
+                );
+                continue;
+            }
+        };
 
-            response
-                .body(upstream.body)
-                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
-        }
-        Err(error) => {
-            warn!(
-                %request_id,
-                provider = %provider.id,
-                protocol = %provider.protocol,
-                %path,
-                error = %error,
-                latency_ms = started_at.elapsed().as_millis(),
-                "upstream llm request failed"
-            );
-            (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
+        let result = state
+            .upstream
+            .send(UpstreamRequest {
+                method: method.clone(),
+                uri: upstream_uri,
+                headers,
+                body: body.clone(),
+            })
+            .await;
+
+        match result {
+            Ok(upstream) if upstream.status.is_server_error() => {
+                warn!(
+                    %request_id,
+                    provider = %provider.id,
+                    protocol = %provider.protocol,
+                    %path,
+                    status = upstream.status.as_u16(),
+                    latency_ms = started_at.elapsed().as_millis(),
+                    "provider returned server error, trying next provider in chain"
+                );
+                last_error = Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
+                continue;
+            }
+            Ok(upstream) => {
+                let status = upstream.status;
+                let mut response = Response::builder().status(status);
+                for (name, value) in upstream.headers.iter() {
+                    if is_response_header_forwardable(name) {
+                        response = response.header(name, value);
+                    }
+                }
+
+                info!(
+                    %request_id,
+                    provider = %provider.id,
+                    protocol = %provider.protocol,
+                    %path,
+                    status = status.as_u16(),
+                    latency_ms = started_at.elapsed().as_millis(),
+                    "proxied llm request"
+                );
+
+                return response
+                    .body(upstream.body)
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+            }
+            Err(error) => {
+                warn!(
+                    %request_id,
+                    provider = %provider.id,
+                    protocol = %provider.protocol,
+                    %path,
+                    error = %error,
+                    latency_ms = started_at.elapsed().as_millis(),
+                    "upstream llm request failed, trying next provider in chain"
+                );
+                last_error = Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
+                continue;
+            }
         }
     }
+
+    last_error.unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "upstream request failed").into_response())
 }
 
 fn request_id(headers: &HeaderMap) -> String {

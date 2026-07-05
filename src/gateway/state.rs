@@ -79,24 +79,63 @@ impl GatewayState {
 
         let mut routes = Vec::new();
         for route in config.routes {
-            let Some(provider) = providers.get(&route.provider) else {
-                warn!(
-                    provider = %route.provider,
-                    path_prefix = %route.path_prefix,
-                    "skipping route because provider is not configured"
-                );
-                continue;
-            };
-
             if route.path_prefix.trim().is_empty() || !route.path_prefix.starts_with('/') {
                 bail!("route path_prefix must start with '/'");
             }
 
+            if route.providers.is_empty() {
+                bail!(
+                    "route '{}' must configure at least one provider",
+                    route.path_prefix
+                );
+            }
+
+            let resolved = route
+                .providers
+                .iter()
+                .map(|id| providers.get(id).map(|provider| (id, provider)))
+                .collect::<Vec<_>>();
+
+            if resolved.iter().all(Option::is_none) {
+                warn!(
+                    path_prefix = %route.path_prefix,
+                    "skipping route because none of its providers are configured"
+                );
+                continue;
+            }
+
+            if let Some(missing) = route
+                .providers
+                .iter()
+                .zip(&resolved)
+                .find_map(|(id, slot)| slot.is_none().then_some(id))
+            {
+                bail!(
+                    "route '{}' references unknown provider '{}'",
+                    route.path_prefix,
+                    missing
+                );
+            }
+
+            let protocol = resolved[0].expect("chain is non-empty and fully resolved").1.protocol;
+            if let Some((id, provider)) = resolved
+                .iter()
+                .flatten()
+                .find(|(_, provider)| provider.protocol != protocol)
+            {
+                bail!(
+                    "route '{}' mixes protocols: provider '{}' is {} but the chain starts with {}",
+                    route.path_prefix,
+                    id,
+                    provider.protocol,
+                    protocol
+                );
+            }
+
             routes.push(Route {
                 path_prefix: route.path_prefix,
-                provider_id: route.provider,
+                provider_ids: route.providers,
                 model_prefix: route.model_prefix,
-                protocol: provider.protocol,
             });
         }
 
@@ -116,25 +155,23 @@ impl GatewayState {
         gateway_key_candidates(headers).any(|key| self.gateway_keys.contains(key))
     }
 
-    pub(super) fn match_route(&self, path: &str, body: &[u8]) -> Option<(&Route, &Provider)> {
+    pub(super) fn match_route(&self, path: &str, body: &[u8]) -> Option<&Route> {
         let model = extract_model(body);
 
         self.routes
             .iter()
             .filter(|route| path.starts_with(&route.path_prefix))
-            .filter(|route| {
+            .find(|route| {
                 route.model_prefix.as_deref().is_none_or(|prefix| {
                     model
                         .as_deref()
                         .is_some_and(|model| model.starts_with(prefix))
                 })
             })
-            .find_map(|route| {
-                self.providers
-                    .get(&route.provider_id)
-                    .filter(|provider| provider.protocol == route.protocol)
-                    .map(|provider| (route, provider))
-            })
+    }
+
+    pub(super) fn provider(&self, id: &str) -> Option<&Provider> {
+        self.providers.get(id)
     }
 }
 
