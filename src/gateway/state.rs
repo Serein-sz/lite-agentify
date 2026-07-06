@@ -6,7 +6,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use axum::http::{HeaderMap, HeaderName, Uri, header::AUTHORIZATION};
-use serde_json::Value;
 use tracing::warn;
 
 use super::{
@@ -193,18 +192,15 @@ impl GatewayState {
         gateway_key_candidates(headers).any(|key| self.gateway_keys.contains(key))
     }
 
-    pub(super) fn match_route(&self, path: &str, body: &[u8]) -> Option<&Route> {
-        let model = extract_model(body);
-
+    pub(super) fn match_route(&self, path: &str, model: Option<&str>) -> Option<&Route> {
         self.routes
             .iter()
             .filter(|route| path.starts_with(&route.path_prefix))
             .find(|route| {
-                route.model_prefix.as_deref().is_none_or(|prefix| {
-                    model
-                        .as_deref()
-                        .is_some_and(|model| model.starts_with(prefix))
-                })
+                route
+                    .model_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| model.is_some_and(|model| model.starts_with(prefix)))
             })
     }
 
@@ -234,19 +230,4 @@ fn gateway_key_candidates(headers: &HeaderMap) -> impl Iterator<Item = &str> {
     .filter_map(|value| value.to_str().ok());
 
     authorization.chain(api_keys)
-}
-
-fn extract_model(body: &[u8]) -> Option<String> {
-    if body.is_empty() {
-        return None;
-    }
-
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
 }

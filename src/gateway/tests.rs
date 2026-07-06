@@ -282,12 +282,8 @@ fn skips_routes_for_missing_providers() {
 
     let state = GatewayState::from_config(config).unwrap();
 
-    assert!(state.match_route("/v1/messages", br#"{}"#).is_none());
-    assert!(
-        state
-            .match_route("/v1/chat/completions", br#"{}"#)
-            .is_some()
-    );
+    assert!(state.match_route("/v1/messages", None).is_none());
+    assert!(state.match_route("/v1/chat/completions", None).is_some());
 }
 
 #[test]
@@ -428,10 +424,7 @@ fn matches_model_prefix_route() {
 
     let state = GatewayState::from_config(config).unwrap();
     let route = state
-        .match_route(
-            "/v1/chat/completions",
-            br#"{"model":"deepseek-chat","messages":[]}"#,
-        )
+        .match_route("/v1/chat/completions", Some("deepseek-chat"))
         .unwrap();
 
     assert_eq!(route.provider_ids, vec!["deepseek".to_owned()]);
@@ -563,6 +556,29 @@ async fn rewrites_model_alias_for_selected_provider() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_model(&client.last_request().body), "gpt-real");
+}
+
+#[tokio::test]
+async fn alias_provider_with_invalid_json_body_returns_bad_request() {
+    let mut config = config();
+    config.providers[0].model_aliases = aliases(&[("public-chat", "gpt-real")]);
+
+    let client = Arc::new(RecordingClient::default());
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+    let app = build_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(client.calls(), 0);
 }
 
 #[tokio::test]

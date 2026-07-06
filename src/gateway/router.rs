@@ -1,6 +1,6 @@
 use std::{str::FromStr, sync::Mutex, time::Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -17,14 +17,14 @@ use uuid::Uuid;
 
 use super::{
     config::GatewayConfig,
-    domain::{TokenUsage, UsageSource},
+    domain::TokenUsage,
     headers::{is_response_header_forwardable, outbound_headers},
     model::{Protocol, Provider},
     pricing::calculate_cost,
     state::GatewayState,
     upstream::{UpstreamRequest, UpstreamResponse},
     usage::{
-        UsageObserver, UsageRecord, parse_non_streaming_usage, recorder_from_config,
+        UsageObserver, UsageRecord, UsageSource, parse_non_streaming_usage, recorder_from_config,
         warn_record_error,
     },
 };
@@ -75,7 +75,9 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
         }
     };
 
-    let Some(route) = state.match_route(&path, &body) else {
+    let payload = RequestPayload::parse(&body);
+
+    let Some(route) = state.match_route(&path, payload.model.as_deref()) else {
         warn!(%request_id, %path, "no gateway route matched");
         return (StatusCode::NOT_FOUND, "no matching gateway route").into_response();
     };
@@ -88,6 +90,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
         method: &method,
         original_headers: &original_headers,
         body: &body,
+        payload: &payload,
         started_at,
     };
 
@@ -140,6 +143,7 @@ struct ProxyContext<'a> {
     method: &'a Method,
     original_headers: &'a HeaderMap,
     body: &'a Bytes,
+    payload: &'a RequestPayload,
     started_at: Instant,
 }
 
@@ -148,7 +152,7 @@ impl ProxyContext<'_> {
         let request_id = self.request_id;
         let path = self.path;
 
-        let provider_body = match body_for_provider(self.body, provider) {
+        let provider_body = match body_for_provider(self.body, self.payload, provider) {
             Ok(Some(body)) => body,
             Ok(None) => {
                 warn!(
@@ -417,14 +421,56 @@ fn upstream_uri(provider: &Provider, path: &str, query: Option<&str>) -> anyhow:
     Uri::from_str(&uri).context("invalid upstream URI")
 }
 
+/// The request body parsed exactly once per request, reused for route matching
+/// and every provider's model-alias resolution.
+struct RequestPayload {
+    /// The parsed JSON value when the body is non-empty and valid JSON.
+    json: Option<Value>,
+    /// The top-level string `model`, when present.
+    model: Option<String>,
+}
+
+impl RequestPayload {
+    fn parse(body: &Bytes) -> Self {
+        if body.is_empty() {
+            return Self {
+                json: None,
+                model: None,
+            };
+        }
+        match serde_json::from_slice::<Value>(body) {
+            Ok(value) => {
+                let model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                Self {
+                    json: Some(value),
+                    model,
+                }
+            }
+            // Non-empty but invalid JSON: no model, no parsed value. The alias
+            // branch of body_for_provider treats a missing value as a parse error.
+            Err(_) => Self {
+                json: None,
+                model: None,
+            },
+        }
+    }
+}
+
 struct ProviderBody {
     body: Bytes,
     requested_model: Option<String>,
     upstream_model: Option<String>,
 }
 
-fn body_for_provider(body: &Bytes, provider: &Provider) -> anyhow::Result<Option<ProviderBody>> {
-    let requested_model = request_model(body);
+fn body_for_provider(
+    body: &Bytes,
+    payload: &RequestPayload,
+    provider: &Provider,
+) -> anyhow::Result<Option<ProviderBody>> {
+    let requested_model = payload.model.clone();
     if provider.model_aliases.is_empty() || body.is_empty() {
         return Ok(Some(ProviderBody {
             body: body.clone(),
@@ -433,8 +479,11 @@ fn body_for_provider(body: &Bytes, provider: &Provider) -> anyhow::Result<Option
         }));
     }
 
-    let mut value =
-        serde_json::from_slice::<Value>(body).context("failed to parse JSON request body")?;
+    // Provider has aliases and the body is non-empty: a non-empty body that did
+    // not parse as JSON is a request error, matching the previous behavior.
+    let Some(value) = payload.json.as_ref() else {
+        bail!("failed to parse JSON request body");
+    };
     let Some(model) = value.get("model").and_then(Value::as_str) else {
         return Ok(Some(ProviderBody {
             body: body.clone(),
@@ -446,6 +495,7 @@ fn body_for_provider(body: &Bytes, provider: &Provider) -> anyhow::Result<Option
         return Ok(None);
     };
 
+    let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
         object.insert("model".to_owned(), Value::String(upstream_model.clone()));
     }
@@ -457,19 +507,4 @@ fn body_for_provider(body: &Bytes, provider: &Provider) -> anyhow::Result<Option
         requested_model,
         upstream_model: Some(upstream_model.clone()),
     }))
-}
-
-fn request_model(body: &[u8]) -> Option<String> {
-    if body.is_empty() {
-        return None;
-    }
-
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
 }

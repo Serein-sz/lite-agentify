@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use crate::gateway::domain::UsageSource;
+use super::source::UsageSource;
 use crate::gateway::model::Protocol;
 
 #[derive(Clone, Debug)]
