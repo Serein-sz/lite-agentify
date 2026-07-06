@@ -5,7 +5,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
@@ -17,13 +17,15 @@ use uuid::Uuid;
 
 use super::{
     config::GatewayConfig,
+    domain::{TokenUsage, UsageSource},
     headers::{is_response_header_forwardable, outbound_headers},
-    model::Provider,
+    model::{Protocol, Provider},
+    pricing::calculate_cost,
     state::GatewayState,
-    upstream::UpstreamRequest,
+    upstream::{UpstreamRequest, UpstreamResponse},
     usage::{
-        UsageObserver, UsageRecord, UsageSource, calculate_cost, parse_non_streaming_usage,
-        recorder_from_config, warn_record_error,
+        UsageObserver, UsageRecord, parse_non_streaming_usage, recorder_from_config,
+        warn_record_error,
     },
 };
 
@@ -78,6 +80,17 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
         return (StatusCode::NOT_FOUND, "no matching gateway route").into_response();
     };
 
+    let ctx = ProxyContext {
+        state: &state,
+        request_id: &request_id,
+        path: &path,
+        query: query.as_deref(),
+        method: &method,
+        original_headers: &original_headers,
+        body: &body,
+        started_at,
+    };
+
     let mut last_error: Option<Response> = None;
     let mut unresolved_model_alias = false;
 
@@ -87,143 +100,10 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
             continue;
         };
 
-        let provider_body = match body_for_provider(&body, provider) {
-            Ok(Some(body)) => body,
-            Ok(None) => {
-                unresolved_model_alias = true;
-                warn!(
-                    %request_id,
-                    %path,
-                    provider = %provider.id,
-                    "provider does not define requested model alias"
-                );
-                continue;
-            }
-            Err(error) => {
-                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to resolve model alias");
-                return (StatusCode::BAD_REQUEST, "failed to resolve model alias").into_response();
-            }
-        };
-
-        let upstream_uri = match upstream_uri(provider, &path, query.as_deref()) {
-            Ok(uri) => uri,
-            Err(error) => {
-                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build upstream URI");
-                last_error =
-                    Some((StatusCode::BAD_GATEWAY, "failed to build upstream URI").into_response());
-                continue;
-            }
-        };
-
-        let headers = match outbound_headers(&original_headers, provider) {
-            Ok(headers) => headers,
-            Err(error) => {
-                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build outbound headers");
-                last_error = Some(
-                    (StatusCode::BAD_GATEWAY, "failed to build outbound headers").into_response(),
-                );
-                continue;
-            }
-        };
-
-        let result = state
-            .upstream
-            .send(UpstreamRequest {
-                method: method.clone(),
-                uri: upstream_uri,
-                headers,
-                body: provider_body.body.clone(),
-            })
-            .await;
-
-        match result {
-            Ok(upstream) if upstream.status.is_server_error() => {
-                warn!(
-                    %request_id,
-                    provider = %provider.id,
-                    protocol = %provider.protocol,
-                    %path,
-                    status = upstream.status.as_u16(),
-                    latency_ms = started_at.elapsed().as_millis(),
-                    "provider returned server error, trying next provider in chain"
-                );
-                last_error =
-                    Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
-                continue;
-            }
-            Ok(upstream) => {
-                let status = upstream.status;
-                let response_headers = upstream.headers.clone();
-                let mut response = Response::builder().status(status);
-                for (name, value) in response_headers.iter() {
-                    if is_response_header_forwardable(name) {
-                        response = response.header(name, value);
-                    }
-                }
-
-                info!(
-                    %request_id,
-                    provider = %provider.id,
-                    protocol = %provider.protocol,
-                    %path,
-                    status = status.as_u16(),
-                    latency_ms = started_at.elapsed().as_millis(),
-                    "proxied llm request"
-                );
-
-                let metadata = UsageMetadata {
-                    request_id: request_id.clone(),
-                    provider_id: provider.id.clone(),
-                    protocol: provider.protocol,
-                    path: path.clone(),
-                    requested_model: provider_body.requested_model,
-                    upstream_model: provider_body.upstream_model,
-                    status: status.as_u16(),
-                    latency_ms: started_at.elapsed().as_millis() as i64,
-                };
-
-                if is_streaming_response(&response_headers) {
-                    let body = usage_observed_stream(state.clone(), metadata, upstream.body);
-                    return response
-                        .body(body)
-                        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-                }
-
-                let body_bytes = match to_bytes(upstream.body, usize::MAX).await {
-                    Ok(body) => body,
-                    Err(error) => {
-                        warn!(%request_id, provider = %provider.id, %path, error = %error, "failed to buffer upstream response body for usage recording");
-                        return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
-                            .into_response();
-                    }
-                };
-
-                record_usage(
-                    &state,
-                    metadata,
-                    UsageSource::ProviderResponse,
-                    parse_non_streaming_usage(provider.protocol, &body_bytes),
-                )
-                .await;
-
-                return response
-                    .body(Body::from(body_bytes))
-                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-            }
-            Err(error) => {
-                warn!(
-                    %request_id,
-                    provider = %provider.id,
-                    protocol = %provider.protocol,
-                    %path,
-                    error = %error,
-                    latency_ms = started_at.elapsed().as_millis(),
-                    "upstream llm request failed, trying next provider in chain"
-                );
-                last_error =
-                    Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
-                continue;
-            }
+        match ctx.attempt_provider(provider).await {
+            ProviderAttempt::Forward(response) => return response,
+            ProviderAttempt::Failover(response) => last_error = Some(response),
+            ProviderAttempt::AliasMissing => unresolved_model_alias = true,
         }
     }
 
@@ -240,11 +120,193 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
     })
 }
 
+/// The outcome of attempting a single provider in a route's failover chain.
+enum ProviderAttempt {
+    /// A terminal response to forward to the client; no further providers are tried.
+    Forward(Response),
+    /// A recoverable failure (transport error or HTTP 5xx); record and try the next provider.
+    Failover(Response),
+    /// The provider has model aliases but does not define the requested alias; skip it.
+    AliasMissing,
+}
+
+/// Shared, immutable request context for a single proxied request, passed to
+/// each provider attempt so the failover loop body stays small.
+struct ProxyContext<'a> {
+    state: &'a GatewayState,
+    request_id: &'a str,
+    path: &'a str,
+    query: Option<&'a str>,
+    method: &'a Method,
+    original_headers: &'a HeaderMap,
+    body: &'a Bytes,
+    started_at: Instant,
+}
+
+impl ProxyContext<'_> {
+    async fn attempt_provider(&self, provider: &Provider) -> ProviderAttempt {
+        let request_id = self.request_id;
+        let path = self.path;
+
+        let provider_body = match body_for_provider(self.body, provider) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                warn!(
+                    %request_id,
+                    %path,
+                    provider = %provider.id,
+                    "provider does not define requested model alias"
+                );
+                return ProviderAttempt::AliasMissing;
+            }
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to resolve model alias");
+                return ProviderAttempt::Forward(
+                    (StatusCode::BAD_REQUEST, "failed to resolve model alias").into_response(),
+                );
+            }
+        };
+
+        let upstream_uri = match upstream_uri(provider, path, self.query) {
+            Ok(uri) => uri,
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build upstream URI");
+                return ProviderAttempt::Failover(
+                    (StatusCode::BAD_GATEWAY, "failed to build upstream URI").into_response(),
+                );
+            }
+        };
+
+        let headers = match outbound_headers(self.original_headers, provider) {
+            Ok(headers) => headers,
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to build outbound headers");
+                return ProviderAttempt::Failover(
+                    (StatusCode::BAD_GATEWAY, "failed to build outbound headers").into_response(),
+                );
+            }
+        };
+
+        let result = self
+            .state
+            .upstream
+            .send(UpstreamRequest {
+                method: self.method.clone(),
+                uri: upstream_uri,
+                headers,
+                body: provider_body.body.clone(),
+            })
+            .await;
+
+        match result {
+            Ok(upstream) if upstream.status.is_server_error() => {
+                warn!(
+                    %request_id,
+                    provider = %provider.id,
+                    protocol = %provider.protocol,
+                    %path,
+                    status = upstream.status.as_u16(),
+                    latency_ms = self.started_at.elapsed().as_millis(),
+                    "provider returned server error, trying next provider in chain"
+                );
+                ProviderAttempt::Failover(
+                    (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+                )
+            }
+            Ok(upstream) => ProviderAttempt::Forward(
+                self.forward_upstream_response(provider, provider_body, upstream)
+                    .await,
+            ),
+            Err(error) => {
+                warn!(
+                    %request_id,
+                    provider = %provider.id,
+                    protocol = %provider.protocol,
+                    %path,
+                    error = %error,
+                    latency_ms = self.started_at.elapsed().as_millis(),
+                    "upstream llm request failed, trying next provider in chain"
+                );
+                ProviderAttempt::Failover(
+                    (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+                )
+            }
+        }
+    }
+
+    async fn forward_upstream_response(
+        &self,
+        provider: &Provider,
+        provider_body: ProviderBody,
+        upstream: UpstreamResponse,
+    ) -> Response {
+        let request_id = self.request_id;
+        let path = self.path;
+        let status = upstream.status;
+        let response_headers = upstream.headers.clone();
+        let mut response = Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            if is_response_header_forwardable(name) {
+                response = response.header(name, value);
+            }
+        }
+
+        info!(
+            %request_id,
+            provider = %provider.id,
+            protocol = %provider.protocol,
+            %path,
+            status = status.as_u16(),
+            latency_ms = self.started_at.elapsed().as_millis(),
+            "proxied llm request"
+        );
+
+        let metadata = UsageMetadata {
+            request_id: request_id.to_owned(),
+            provider_id: provider.id.clone(),
+            protocol: provider.protocol,
+            path: path.to_owned(),
+            requested_model: provider_body.requested_model,
+            upstream_model: provider_body.upstream_model,
+            status: status.as_u16(),
+            latency_ms: self.started_at.elapsed().as_millis() as i64,
+        };
+
+        if is_streaming_response(&response_headers) {
+            let body = usage_observed_stream(self.state.clone(), metadata, upstream.body);
+            return response
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        }
+
+        let body_bytes = match to_bytes(upstream.body, usize::MAX).await {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(%request_id, provider = %provider.id, %path, error = %error, "failed to buffer upstream response body for usage recording");
+                return (StatusCode::BAD_GATEWAY, "failed to read upstream response")
+                    .into_response();
+            }
+        };
+
+        record_usage(
+            self.state,
+            metadata,
+            UsageSource::ProviderResponse,
+            parse_non_streaming_usage(provider.protocol, &body_bytes),
+        )
+        .await;
+
+        response
+            .body(Body::from(body_bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+    }
+}
+
 #[derive(Clone)]
 struct UsageMetadata {
     request_id: String,
     provider_id: String,
-    protocol: super::model::Protocol,
+    protocol: Protocol,
     path: String,
     requested_model: Option<String>,
     upstream_model: Option<String>,
@@ -256,7 +318,7 @@ async fn record_usage(
     state: &GatewayState,
     metadata: UsageMetadata,
     source: UsageSource,
-    usage: Option<super::usage::TokenUsage>,
+    usage: Option<TokenUsage>,
 ) {
     let usage_source = if usage.is_some() {
         source

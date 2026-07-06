@@ -12,8 +12,9 @@ use tracing::warn;
 use super::{
     config::GatewayConfig,
     model::{Provider, Route, trim_trailing_slash},
+    pricing::{PricingMap, pricing_map},
     upstream::{HyperUpstreamClient, UpstreamClient},
-    usage::{NoopUsageRecorder, PricingMap, UsageRecorder, pricing_map},
+    usage::{NoopUsageRecorder, UsageRecorder},
 };
 
 #[derive(Clone)]
