@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -77,6 +77,7 @@ enum Outcome {
 struct ScriptedClient {
     outcomes: Mutex<VecDeque<Outcome>>,
     uris: Mutex<Vec<String>>,
+    bodies: Mutex<Vec<Bytes>>,
     calls: AtomicUsize,
 }
 
@@ -85,6 +86,7 @@ impl ScriptedClient {
         Self {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             uris: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         }
     }
@@ -96,12 +98,17 @@ impl ScriptedClient {
     fn uris(&self) -> Vec<String> {
         self.uris.lock().unwrap().clone()
     }
+
+    fn bodies(&self) -> Vec<Bytes> {
+        self.bodies.lock().unwrap().clone()
+    }
 }
 
 impl UpstreamClient for ScriptedClient {
     fn send(&self, request: UpstreamRequest) -> UpstreamFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.uris.lock().unwrap().push(request.uri.to_string());
+        self.bodies.lock().unwrap().push(request.body.clone());
         let outcome = self
             .outcomes
             .lock()
@@ -122,6 +129,23 @@ impl UpstreamClient for ScriptedClient {
     }
 }
 
+fn aliases(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(alias, upstream)| ((*alias).to_owned(), (*upstream).to_owned()))
+        .collect()
+}
+
+fn body_model(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .unwrap()
+        .get("model")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 /// Config with a single OpenAI-compatible route whose chain is `[primary, fallback]`.
 fn failover_config() -> GatewayConfig {
     GatewayConfig {
@@ -134,6 +158,7 @@ fn failover_config() -> GatewayConfig {
                 base_url: "http://primary.test".to_owned(),
                 api_key: "primary-secret".to_owned(),
                 anthropic_version: None,
+                model_aliases: HashMap::new(),
             },
             ProviderConfig {
                 id: "fallback".to_owned(),
@@ -141,6 +166,7 @@ fn failover_config() -> GatewayConfig {
                 base_url: "http://fallback.test".to_owned(),
                 api_key: "fallback-secret".to_owned(),
                 anthropic_version: None,
+                model_aliases: HashMap::new(),
             },
         ],
         routes: vec![RouteConfig {
@@ -152,10 +178,14 @@ fn failover_config() -> GatewayConfig {
 }
 
 async fn send_chat(app: axum::Router) -> Response<Body> {
+    app_send_chat_with_model(app, "gpt-test").await
+}
+
+async fn app_send_chat_with_model(app: axum::Router, model: &str) -> Response<Body> {
     app.oneshot(
         HttpRequest::post("/v1/chat/completions")
             .header(AUTHORIZATION, "Bearer gw-secret")
-            .body(Body::from(r#"{"model":"gpt-test"}"#))
+            .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
             .unwrap(),
     )
     .await
@@ -173,6 +203,7 @@ fn config() -> GatewayConfig {
                 base_url: "http://openai.test".to_owned(),
                 api_key: "openai-secret".to_owned(),
                 anthropic_version: None,
+                model_aliases: HashMap::new(),
             },
             ProviderConfig {
                 id: "anthropic".to_owned(),
@@ -180,6 +211,7 @@ fn config() -> GatewayConfig {
                 base_url: "http://anthropic.test".to_owned(),
                 api_key: "anthropic-secret".to_owned(),
                 anthropic_version: Some("2023-06-01".to_owned()),
+                model_aliases: HashMap::new(),
             },
         ],
         routes: vec![
@@ -242,6 +274,17 @@ fn uses_configured_provider_credentials() {
 }
 
 #[test]
+fn validates_provider_model_aliases() {
+    let mut config_with_empty_alias = config();
+    config_with_empty_alias.providers[0].model_aliases = aliases(&[("", "gpt-real")]);
+    assert!(GatewayState::from_config(config_with_empty_alias).is_err());
+
+    let mut config_with_empty_upstream = config();
+    config_with_empty_upstream.providers[0].model_aliases = aliases(&[("public-chat", "")]);
+    assert!(GatewayState::from_config(config_with_empty_upstream).is_err());
+}
+
+#[test]
 fn matches_model_prefix_route() {
     let mut config = config();
     config.providers.push(ProviderConfig {
@@ -250,6 +293,7 @@ fn matches_model_prefix_route() {
         base_url: "http://deepseek.test".to_owned(),
         api_key: "deepseek-secret".to_owned(),
         anthropic_version: None,
+        model_aliases: HashMap::new(),
     });
     config.routes.insert(
         0,
@@ -377,6 +421,87 @@ async fn attaches_openai_provider_credentials() {
 }
 
 #[tokio::test]
+async fn rewrites_model_alias_for_selected_provider() {
+    let mut config = config();
+    config.providers[0].model_aliases = aliases(&[("public-chat", "gpt-real")]);
+
+    let client = Arc::new(RecordingClient::default());
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+    let app = build_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from(r#"{"model":"public-chat"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_model(&client.last_request().body), "gpt-real");
+}
+
+#[tokio::test]
+async fn provider_without_aliases_preserves_original_model() {
+    let client = Arc::new(RecordingClient::default());
+    let state = GatewayState::from_config_with_upstream(config(), client.clone()).unwrap();
+    let app = build_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from(r#"{"model":"gpt-test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        client.last_request().body,
+        Bytes::from_static(br#"{"model":"gpt-test"}"#)
+    );
+}
+
+#[tokio::test]
+async fn preserves_non_model_fields_and_provider_response() {
+    let mut config = config();
+    config.providers[0].model_aliases = aliases(&[("public-chat", "gpt-real")]);
+    let client = Arc::new(RecordingClient::with_body(
+        r#"{"model":"provider-real","id":"response-1"}"#,
+    ));
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+    let app = build_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from(
+                    r#"{"model":"public-chat","temperature":0.2,"messages":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let request_body =
+        serde_json::from_slice::<serde_json::Value>(&client.last_request().body).unwrap();
+    assert_eq!(request_body["model"], "gpt-real");
+    assert_eq!(request_body["temperature"], 0.2);
+    assert_eq!(request_body["messages"], serde_json::json!([]));
+
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        response_body,
+        Bytes::from_static(br#"{"model":"provider-real","id":"response-1"}"#)
+    );
+}
+
+#[tokio::test]
 async fn attaches_anthropic_provider_headers() {
     let client = Arc::new(RecordingClient::default());
     let state = GatewayState::from_config_with_upstream(config(), client.clone()).unwrap();
@@ -500,6 +625,63 @@ async fn primary_transport_error_fails_over_to_fallback() {
             "http://fallback.test/v1/chat/completions".to_owned(),
         ]
     );
+}
+
+#[tokio::test]
+async fn fallback_provider_receives_its_own_model_alias() {
+    let mut config = failover_config();
+    config.providers[0].model_aliases = aliases(&[("public-chat", "primary-real")]);
+    config.providers[1].model_aliases = aliases(&[("public-chat", "fallback-real")]);
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::TransportError,
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+
+    let response = app_send_chat_with_model(build_router_with_state(state), "public-chat").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .bodies()
+            .iter()
+            .map(|body| body_model(body))
+            .collect::<Vec<_>>(),
+        vec!["primary-real".to_owned(), "fallback-real".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn skips_alias_enabled_provider_without_requested_alias() {
+    let mut config = failover_config();
+    config.providers[0].model_aliases = aliases(&[("other-chat", "primary-real")]);
+    config.providers[1].model_aliases = aliases(&[("public-chat", "fallback-real")]);
+    let client = Arc::new(ScriptedClient::new([Outcome::Status(StatusCode::OK)]));
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+
+    let response = app_send_chat_with_model(build_router_with_state(state), "public-chat").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 1);
+    assert_eq!(
+        client.uris(),
+        vec!["http://fallback.test/v1/chat/completions".to_owned()]
+    );
+    assert_eq!(body_model(&client.bodies()[0]), "fallback-real");
+}
+
+#[tokio::test]
+async fn returns_gateway_error_when_no_provider_resolves_alias() {
+    let mut config = failover_config();
+    config.providers[0].model_aliases = aliases(&[("other-chat", "primary-real")]);
+    config.providers[1].model_aliases = aliases(&[("other-chat", "fallback-real")]);
+    let client = Arc::new(RecordingClient::default());
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+
+    let response = app_send_chat_with_model(build_router_with_state(state), "public-chat").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(client.calls(), 0);
 }
 
 #[tokio::test]

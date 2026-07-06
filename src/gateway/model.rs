@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use serde::Deserialize;
 
@@ -26,6 +26,7 @@ pub(super) struct Provider {
     pub base_url: String,
     pub api_key: String,
     pub anthropic_version: Option<String>,
+    pub model_aliases: HashMap<String, String>,
 }
 
 #[derive(Clone)]

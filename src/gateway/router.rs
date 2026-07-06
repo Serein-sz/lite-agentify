@@ -3,12 +3,13 @@ use std::{str::FromStr, time::Instant};
 use anyhow::Context;
 use axum::{
     Router,
-    body::to_bytes,
+    body::{Bytes, to_bytes},
     extract::{Request, State},
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -67,11 +68,30 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
     };
 
     let mut last_error: Option<Response> = None;
+    let mut unresolved_model_alias = false;
 
     for provider_id in &route.provider_ids {
         let Some(provider) = state.provider(provider_id) else {
             // from_config guarantees every id resolves; skip defensively.
             continue;
+        };
+
+        let provider_body = match body_for_provider(&body, provider) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                unresolved_model_alias = true;
+                warn!(
+                    %request_id,
+                    %path,
+                    provider = %provider.id,
+                    "provider does not define requested model alias"
+                );
+                continue;
+            }
+            Err(error) => {
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to resolve model alias");
+                return (StatusCode::BAD_REQUEST, "failed to resolve model alias").into_response();
+            }
         };
 
         let upstream_uri = match upstream_uri(provider, &path, query.as_deref()) {
@@ -101,7 +121,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
                 method: method.clone(),
                 uri: upstream_uri,
                 headers,
-                body: body.clone(),
+                body: provider_body,
             })
             .await;
 
@@ -116,7 +136,8 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
                     latency_ms = started_at.elapsed().as_millis(),
                     "provider returned server error, trying next provider in chain"
                 );
-                last_error = Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
+                last_error =
+                    Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
                 continue;
             }
             Ok(upstream) => {
@@ -152,13 +173,24 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
                     latency_ms = started_at.elapsed().as_millis(),
                     "upstream llm request failed, trying next provider in chain"
                 );
-                last_error = Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
+                last_error =
+                    Some((StatusCode::BAD_GATEWAY, "upstream request failed").into_response());
                 continue;
             }
         }
     }
 
-    last_error.unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "upstream request failed").into_response())
+    last_error.unwrap_or_else(|| {
+        if unresolved_model_alias {
+            (
+                StatusCode::BAD_GATEWAY,
+                "no provider could resolve model alias",
+            )
+                .into_response()
+        } else {
+            (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
+        }
+    })
 }
 
 fn request_id(headers: &HeaderMap) -> String {
@@ -176,4 +208,27 @@ fn upstream_uri(provider: &Provider, path: &str, query: Option<&str>) -> anyhow:
         uri.push_str(query);
     }
     Uri::from_str(&uri).context("invalid upstream URI")
+}
+
+fn body_for_provider(body: &Bytes, provider: &Provider) -> anyhow::Result<Option<Bytes>> {
+    if provider.model_aliases.is_empty() || body.is_empty() {
+        return Ok(Some(body.clone()));
+    }
+
+    let mut value =
+        serde_json::from_slice::<Value>(body).context("failed to parse JSON request body")?;
+    let Some(model) = value.get("model").and_then(Value::as_str) else {
+        return Ok(Some(body.clone()));
+    };
+    let Some(upstream_model) = provider.model_aliases.get(model) else {
+        return Ok(None);
+    };
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert("model".to_owned(), Value::String(upstream_model.clone()));
+    }
+
+    Ok(Some(Bytes::from(
+        serde_json::to_vec(&value).context("failed to serialize JSON request body")?,
+    )))
 }

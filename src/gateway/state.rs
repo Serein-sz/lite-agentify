@@ -61,6 +61,23 @@ impl GatewayState {
                 bail!("provider '{}' api_key cannot be empty", provider.id);
             }
 
+            for (alias, upstream_model) in &provider.model_aliases {
+                if alias.trim().is_empty() {
+                    bail!(
+                        "provider '{}' model_aliases cannot contain an empty alias",
+                        provider.id
+                    );
+                }
+
+                if upstream_model.trim().is_empty() {
+                    bail!(
+                        "provider '{}' model_aliases cannot map '{}' to an empty upstream model",
+                        provider.id,
+                        alias
+                    );
+                }
+            }
+
             providers.insert(
                 provider.id.clone(),
                 Provider {
@@ -69,6 +86,7 @@ impl GatewayState {
                     base_url: trim_trailing_slash(&provider.base_url).to_owned(),
                     api_key: provider.api_key,
                     anthropic_version: provider.anthropic_version,
+                    model_aliases: provider.model_aliases,
                 },
             );
         }
@@ -117,7 +135,10 @@ impl GatewayState {
                 );
             }
 
-            let protocol = resolved[0].expect("chain is non-empty and fully resolved").1.protocol;
+            let protocol = resolved[0]
+                .expect("chain is non-empty and fully resolved")
+                .1
+                .protocol;
             if let Some((id, provider)) = resolved
                 .iter()
                 .flatten()

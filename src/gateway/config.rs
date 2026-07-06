@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -33,6 +34,8 @@ pub struct ProviderConfig {
     pub api_key: String,
     #[serde(default)]
     pub anthropic_version: Option<String>,
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
