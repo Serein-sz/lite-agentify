@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use super::model::{Protocol, default_listen_addr};
@@ -24,6 +25,10 @@ pub struct GatewayConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    #[serde(default)]
+    pub usage_database: Option<UsageDatabaseConfig>,
+    #[serde(default)]
+    pub pricing: Vec<PricingConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +49,32 @@ pub struct RouteConfig {
     pub providers: Vec<String>,
     #[serde(default)]
     pub model_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageDatabaseConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub url: String,
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingConfig {
+    pub provider: String,
+    pub model: String,
+    pub input_per_1m: Decimal,
+    pub output_per_1m: Decimal,
+    #[serde(default)]
+    pub cached_input_per_1m: Option<Decimal>,
+    #[serde(default)]
+    pub cache_read_per_1m: Option<Decimal>,
+    #[serde(default)]
+    pub cache_write_per_1m: Option<Decimal>,
+    pub currency: String,
+    #[serde(default)]
+    pub pricing_source: Option<String>,
 }
 
 impl GatewayConfig {
@@ -79,4 +110,8 @@ fn user_home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn default_true() -> bool {
+    true
 }

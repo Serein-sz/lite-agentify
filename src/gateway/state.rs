@@ -13,6 +13,7 @@ use super::{
     config::GatewayConfig,
     model::{Provider, Route, trim_trailing_slash},
     upstream::{HyperUpstreamClient, UpstreamClient},
+    usage::{NoopUsageRecorder, PricingMap, UsageRecorder, pricing_map},
 };
 
 #[derive(Clone)]
@@ -21,22 +22,35 @@ pub(super) struct GatewayState {
     pub(super) providers: Arc<HashMap<String, Provider>>,
     pub(super) routes: Arc<Vec<Route>>,
     pub(super) upstream: Arc<dyn UpstreamClient>,
+    pub(super) usage_recorder: Arc<dyn UsageRecorder>,
+    pub(super) pricing: PricingMap,
 }
 
 impl GatewayState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn from_config(config: GatewayConfig) -> anyhow::Result<Self> {
         Self::from_config_with_upstream(config, Arc::new(HyperUpstreamClient::new()))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn from_config_with_upstream(
         config: GatewayConfig,
         upstream: Arc<dyn UpstreamClient>,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_with_upstream_and_recorder(config, upstream, Arc::new(NoopUsageRecorder))
+    }
+
+    pub(super) fn from_config_with_upstream_and_recorder(
+        config: GatewayConfig,
+        upstream: Arc<dyn UpstreamClient>,
+        usage_recorder: Arc<dyn UsageRecorder>,
     ) -> anyhow::Result<Self> {
         if config.gateway_keys.is_empty() {
             bail!("at least one gateway key is required");
         }
 
         let gateway_keys = config.gateway_keys.into_iter().collect::<HashSet<_>>();
+        let pricing = pricing_map(config.pricing)?;
         let mut providers = HashMap::new();
 
         for provider in config.providers {
@@ -169,6 +183,8 @@ impl GatewayState {
             providers: Arc::new(providers),
             routes: Arc::new(routes),
             upstream,
+            usage_recorder,
+            pricing,
         })
     }
 

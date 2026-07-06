@@ -17,7 +17,7 @@ async fn start_web_server() -> anyhow::Result<()> {
     })?;
 
     let listen_addr = config.listen_addr;
-    let app = gateway::build_router(config).inspect_err(|error| {
+    let app = gateway::build_router(config).await.inspect_err(|error| {
         error!(%error, "failed to build gateway router");
     })?;
 

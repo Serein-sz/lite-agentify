@@ -13,14 +13,16 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
 };
+use rust_decimal::Decimal;
 use tower::ServiceExt;
 
 use super::{
-    config::{GatewayConfig, ProviderConfig, RouteConfig},
+    config::{GatewayConfig, PricingConfig, ProviderConfig, RouteConfig},
     model::{Protocol, default_listen_addr},
     router::build_router_with_state,
     state::GatewayState,
     upstream::{UpstreamClient, UpstreamFuture, UpstreamRequest, UpstreamResponse},
+    usage::MemoryUsageRecorder,
 };
 
 #[derive(Default)]
@@ -28,12 +30,22 @@ struct RecordingClient {
     calls: AtomicUsize,
     requests: Mutex<Vec<UpstreamRequest>>,
     response_body: Mutex<Option<&'static str>>,
+    response_content_type: Option<&'static str>,
 }
 
 impl RecordingClient {
     fn with_body(body: &'static str) -> Self {
         Self {
             response_body: Mutex::new(Some(body)),
+            response_content_type: Some("text/event-stream"),
+            ..Self::default()
+        }
+    }
+
+    fn with_json_body(body: &'static str) -> Self {
+        Self {
+            response_body: Mutex::new(Some(body)),
+            response_content_type: Some("application/json"),
             ..Self::default()
         }
     }
@@ -52,10 +64,13 @@ impl UpstreamClient for RecordingClient {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(request);
         let body = self.response_body.lock().unwrap().take().unwrap_or("{}");
+        let response_content_type = self.response_content_type;
 
         Box::pin(async move {
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if let Some(content_type) = response_content_type {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            }
 
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
@@ -174,6 +189,8 @@ fn failover_config() -> GatewayConfig {
             providers: vec!["primary".to_owned(), "fallback".to_owned()],
             model_prefix: None,
         }],
+        usage_database: None,
+        pricing: Vec::new(),
     }
 }
 
@@ -226,7 +243,26 @@ fn config() -> GatewayConfig {
                 model_prefix: None,
             },
         ],
+        usage_database: None,
+        pricing: Vec::new(),
     }
+}
+
+fn priced_config() -> GatewayConfig {
+    let mut config = config();
+    config.providers[0].model_aliases = aliases(&[("public-chat", "gpt-real")]);
+    config.pricing = vec![PricingConfig {
+        provider: "openai".to_owned(),
+        model: "gpt-real".to_owned(),
+        input_per_1m: Decimal::new(200, 2),
+        output_per_1m: Decimal::new(800, 2),
+        cached_input_per_1m: Some(Decimal::new(50, 2)),
+        cache_read_per_1m: None,
+        cache_write_per_1m: None,
+        currency: "USD".to_owned(),
+        pricing_source: Some("test-pricing".to_owned()),
+    }];
+    config
 }
 
 #[test]
@@ -282,6 +318,92 @@ fn validates_provider_model_aliases() {
     let mut config_with_empty_upstream = config();
     config_with_empty_upstream.providers[0].model_aliases = aliases(&[("public-chat", "")]);
     assert!(GatewayState::from_config(config_with_empty_upstream).is_err());
+}
+
+#[test]
+fn loads_usage_database_and_pricing_config() {
+    let parsed: GatewayConfig = toml::from_str(
+        r#"
+listen_addr = "127.0.0.1:3000"
+gateway_keys = ["gw-secret"]
+
+[usage_database]
+enabled = true
+url = "postgres://lite_agentify:password@localhost/lite_agentify"
+max_connections = 5
+
+[[providers]]
+id = "openai"
+protocol = "openai"
+base_url = "http://openai.test"
+api_key = "openai-secret"
+
+[[routes]]
+path_prefix = "/v1/chat/completions"
+providers = ["openai"]
+
+[[pricing]]
+provider = "openai"
+model = "gpt-real"
+input_per_1m = "2.00"
+output_per_1m = "8.00"
+cached_input_per_1m = "0.50"
+currency = "USD"
+pricing_source = "manual-test"
+"#,
+    )
+    .unwrap();
+
+    let database = parsed.usage_database.as_ref().unwrap();
+    assert!(database.enabled);
+    assert_eq!(database.max_connections, Some(5));
+    assert_eq!(parsed.pricing[0].currency, "USD");
+    assert!(GatewayState::from_config(parsed).is_ok());
+}
+
+#[test]
+fn validates_pricing_entries() {
+    let mut config_with_empty_provider = config();
+    config_with_empty_provider.pricing = vec![PricingConfig {
+        provider: "".to_owned(),
+        model: "gpt-real".to_owned(),
+        input_per_1m: Decimal::ONE,
+        output_per_1m: Decimal::ONE,
+        cached_input_per_1m: None,
+        cache_read_per_1m: None,
+        cache_write_per_1m: None,
+        currency: "USD".to_owned(),
+        pricing_source: None,
+    }];
+    assert!(GatewayState::from_config(config_with_empty_provider).is_err());
+
+    let mut config_with_negative_price = config();
+    config_with_negative_price.pricing = vec![PricingConfig {
+        provider: "openai".to_owned(),
+        model: "gpt-real".to_owned(),
+        input_per_1m: Decimal::NEGATIVE_ONE,
+        output_per_1m: Decimal::ONE,
+        cached_input_per_1m: None,
+        cache_read_per_1m: None,
+        cache_write_per_1m: None,
+        currency: "USD".to_owned(),
+        pricing_source: None,
+    }];
+    assert!(GatewayState::from_config(config_with_negative_price).is_err());
+
+    let mut config_with_bad_currency = config();
+    config_with_bad_currency.pricing = vec![PricingConfig {
+        provider: "openai".to_owned(),
+        model: "gpt-real".to_owned(),
+        input_per_1m: Decimal::ONE,
+        output_per_1m: Decimal::ONE,
+        cached_input_per_1m: None,
+        cache_read_per_1m: None,
+        cache_write_per_1m: None,
+        currency: "usd".to_owned(),
+        pricing_source: None,
+    }];
+    assert!(GatewayState::from_config(config_with_bad_currency).is_err());
 }
 
 #[test]
@@ -574,6 +696,134 @@ async fn forwards_streaming_bytes_without_rewriting() {
     assert_eq!(
         body,
         Bytes::from_static(b"event: message\ndata: {\"x\":1}\n\n")
+    );
+}
+
+#[tokio::test]
+async fn records_non_streaming_usage_and_estimated_cost() {
+    let client = Arc::new(RecordingClient::with_json_body(
+        r#"{"id":"response-1","usage":{"prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200,"prompt_tokens_details":{"cached_tokens":400}}}"#,
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::default());
+    let state = GatewayState::from_config_with_upstream_and_recorder(
+        priced_config(),
+        client,
+        recorder.clone(),
+    )
+    .unwrap();
+
+    let response = app_send_chat_with_model(build_router_with_state(state), "public-chat").await;
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    assert_eq!(
+        response_body,
+        Bytes::from_static(
+            br#"{"id":"response-1","usage":{"prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200,"prompt_tokens_details":{"cached_tokens":400}}}"#
+        )
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.provider_id, "openai");
+    assert_eq!(record.requested_model.as_deref(), Some("public-chat"));
+    assert_eq!(record.upstream_model.as_deref(), Some("gpt-real"));
+    assert_eq!(record.input_tokens, Some(1000));
+    assert_eq!(record.output_tokens, Some(200));
+    assert_eq!(record.cached_input_tokens, Some(400));
+    assert_eq!(record.estimated_cost, Some(Decimal::new(30, 4)));
+    assert_eq!(record.currency.as_deref(), Some("USD"));
+    assert_eq!(record.pricing_source.as_deref(), Some("test-pricing"));
+}
+
+#[tokio::test]
+async fn records_streaming_usage_without_rewriting_stream() {
+    let client = Arc::new(RecordingClient::with_body(
+        "data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25,\"total_tokens\":125}}\n\ndata: [DONE]\n\n",
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::default());
+    let mut config = config();
+    config.pricing = vec![PricingConfig {
+        provider: "openai".to_owned(),
+        model: "gpt-test".to_owned(),
+        input_per_1m: Decimal::new(200, 2),
+        output_per_1m: Decimal::new(800, 2),
+        cached_input_per_1m: None,
+        cache_read_per_1m: None,
+        cache_write_per_1m: None,
+        currency: "USD".to_owned(),
+        pricing_source: None,
+    }];
+    let state =
+        GatewayState::from_config_with_upstream_and_recorder(config, client, recorder.clone())
+            .unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    assert_eq!(
+        body,
+        Bytes::from_static(
+            b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25,\"total_tokens\":125}}\n\ndata: [DONE]\n\n"
+        )
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_tokens, Some(100));
+    assert_eq!(records[0].output_tokens, Some(25));
+}
+
+#[tokio::test]
+async fn persisted_usage_record_excludes_prompt_and_completion_content() {
+    let client = Arc::new(RecordingClient::with_json_body(
+        r#"{"choices":[{"message":{"content":"SECRET_COMPLETION"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::default());
+    let state = GatewayState::from_config_with_upstream_and_recorder(
+        priced_config(),
+        client,
+        recorder.clone(),
+    )
+    .unwrap();
+
+    let app = build_router_with_state(state);
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from(
+                    r#"{"model":"public-chat","messages":[{"role":"user","content":"SECRET_PROMPT"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let record_debug = format!("{:?}", recorder.records());
+    assert!(!record_debug.contains("SECRET_PROMPT"));
+    assert!(!record_debug.contains("SECRET_COMPLETION"));
+}
+
+#[tokio::test]
+async fn usage_persistence_failure_does_not_alter_response() {
+    let client = Arc::new(RecordingClient::with_json_body(
+        r#"{"id":"response-1","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::failing());
+    let state =
+        GatewayState::from_config_with_upstream_and_recorder(priced_config(), client, recorder)
+            .unwrap();
+
+    let response = app_send_chat_with_model(build_router_with_state(state), "public-chat").await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        Bytes::from_static(
+            br#"{"id":"response-1","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#
+        )
     );
 }
 

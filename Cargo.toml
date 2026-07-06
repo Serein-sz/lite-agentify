@@ -20,3 +20,8 @@ hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2"
 toml = "0.9.8"
 tower = { version = "0.5.2", features = ["util"] }
 uuid = { version = "1.19.0", features = ["v4"] }
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+chrono = "0.4.42"
+rust_decimal = { version = "1.39.0", features = ["serde"] }
+sea-orm = { version = "1.1.17", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-chrono", "with-rust_decimal", "with-uuid"] }
