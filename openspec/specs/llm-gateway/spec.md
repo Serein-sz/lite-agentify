@@ -199,7 +199,7 @@ The system SHALL persist token usage and estimated cost for completed provider p
 - **THEN** the gateway MUST persist token counts and MUST leave estimated cost unavailable.
 
 ### Requirement: Gateway estimates cost with cache-aware pricing
-The system SHALL calculate estimated cost from configured provider/model pricing and MUST account for cached token classes separately from regular input tokens.
+The system SHALL calculate estimated cost from configured provider/model pricing and MUST account for cached token classes separately from regular input tokens. The system MUST subtract from regular input tokens only cache token classes that the provider reports as a subset of input tokens, MUST NOT subtract cache token classes the provider reports independently of input tokens, and MUST NOT produce a negative estimated cost.
 
 #### Scenario: OpenAI-compatible cached prompt tokens are priced separately
 - **WHEN** OpenAI-compatible usage metadata includes cached prompt tokens
@@ -207,22 +207,34 @@ The system SHALL calculate estimated cost from configured provider/model pricing
 
 #### Scenario: Anthropic-compatible cache tokens are priced separately
 - **WHEN** Anthropic-compatible usage metadata includes cache creation or cache read input tokens
-- **THEN** the gateway MUST subtract cache creation and cache read input tokens from regular input tokens before applying regular input pricing and MUST apply cache write and cache read pricing to those token classes when configured.
+- **THEN** the gateway MUST NOT subtract cache creation or cache read input tokens from regular input tokens, because the provider reports them independently of input tokens, and MUST apply cache write and cache read pricing to those token classes when configured.
 
 #### Scenario: Cache usage lacks cache pricing
 - **WHEN** usage metadata includes cache token counts but the matching pricing entry lacks the required cache price
 - **THEN** the gateway MUST persist token counts and MUST leave estimated cost unavailable rather than charging cache tokens as regular input tokens.
 
+#### Scenario: Cache read tokens exceed reported input tokens
+- **WHEN** usage metadata reports cache read or cache creation tokens that exceed the reported input tokens
+- **THEN** the gateway MUST estimate a non-negative cost and MUST NOT reduce regular input tokens below zero.
+
 ### Requirement: Gateway observes streaming usage without rewriting streams
-The system SHALL observe provider-native streaming responses for usage metadata while forwarding stream bytes to clients unchanged.
+The system SHALL observe provider-native streaming responses for usage metadata while forwarding stream bytes to clients unchanged. The system SHALL parse SSE events incrementally as bytes arrive rather than buffering the full response body, and SHALL merge usage fields reported across separate stream events into a single usage result.
 
 #### Scenario: OpenAI-compatible stream exposes final usage
 - **WHEN** an OpenAI-compatible streaming response includes final usage metadata
 - **THEN** the gateway MUST persist token usage and estimated cost after the stream completes without rewriting SSE event payloads.
 
-#### Scenario: Anthropic-compatible stream exposes usage events
-- **WHEN** an Anthropic-compatible streaming response includes provider-native usage metadata
-- **THEN** the gateway MUST persist token usage and estimated cost after the stream completes without rewriting SSE event payloads.
+#### Scenario: Anthropic-compatible stream reports input and output tokens across events
+- **WHEN** an Anthropic-compatible streaming response reports input tokens in a `message_start` event and output tokens in a `message_delta` event
+- **THEN** the gateway MUST persist both the input tokens from the `message_start` usage and the output tokens from the `message_delta` usage after the stream completes without rewriting SSE event payloads.
+
+#### Scenario: Usage fields split across events are merged
+- **WHEN** a streaming response reports different token classes in separate SSE events
+- **THEN** the gateway MUST merge the reported token classes into a single usage result rather than replacing earlier fields with only the latest event.
+
+#### Scenario: Usage payload spans chunk boundaries
+- **WHEN** a single SSE usage line is delivered across more than one stream chunk
+- **THEN** the gateway MUST reassemble the line before parsing and MUST persist the usage it reports.
 
 #### Scenario: Streaming usage cannot be parsed
 - **WHEN** a streaming response is missing parseable usage metadata or usage parsing fails

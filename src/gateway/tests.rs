@@ -773,6 +773,63 @@ async fn records_streaming_usage_without_rewriting_stream() {
 }
 
 #[tokio::test]
+async fn records_anthropic_streaming_usage_across_events() {
+    let client = Arc::new(RecordingClient::with_body(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":270}}\n\n",
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::default());
+    let state =
+        GatewayState::from_config_with_upstream_and_recorder(config(), client, recorder.clone())
+            .unwrap();
+
+    let app = build_router_with_state(state);
+    let response = app
+        .oneshot(
+            HttpRequest::post("/v1/messages")
+                .header(AUTHORIZATION, "Bearer gw-secret")
+                .body(Body::from(r#"{"model":"claude","stream":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_tokens, Some(25));
+    assert_eq!(records[0].output_tokens, Some(270));
+}
+
+#[tokio::test]
+async fn streaming_without_usage_forwards_bytes_and_records_unavailable() {
+    let client = Arc::new(RecordingClient::with_body(
+        "event: message\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+    ));
+    let recorder = Arc::new(MemoryUsageRecorder::default());
+    let state =
+        GatewayState::from_config_with_upstream_and_recorder(config(), client, recorder.clone())
+            .unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    assert_eq!(
+        body,
+        Bytes::from_static(
+            b"event: message\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+        )
+    );
+    let records = recorder.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].usage_source,
+        super::usage::UsageSource::Unavailable
+    );
+    assert_eq!(records[0].input_tokens, None);
+    assert_eq!(records[0].output_tokens, None);
+}
+
+#[tokio::test]
 async fn persisted_usage_record_excludes_prompt_and_completion_content() {
     let client = Arc::new(RecordingClient::with_json_body(
         r#"{"choices":[{"message":{"content":"SECRET_COMPLETION"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,

@@ -323,7 +323,10 @@ fn usage_observed_stream(state: GatewayState, metadata: UsageMetadata, body: Bod
             }
         }
 
-        let usage = observer.lock().ok().and_then(|observer| observer.finish());
+        let usage = observer
+            .lock()
+            .ok()
+            .and_then(|mut observer| observer.finish());
         record_usage(&state, metadata, UsageSource::StreamSummary, usage).await;
     })
 }

@@ -5,8 +5,8 @@ use axum::body::Bytes;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sea_orm::{
-    ActiveModelTrait, ConnectOptions, Database, DatabaseConnection, DeriveEntityModel,
-    DeriveRelation, EnumIter, Set, entity::prelude::*,
+    ConnectOptions, Database, DatabaseConnection, DeriveEntityModel, DeriveRelation, EntityTrait,
+    EnumIter, Set, entity::prelude::*,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -51,6 +51,27 @@ impl TokenUsage {
             || self.cache_read_tokens.is_some()
             || self.cache_write_tokens.is_some()
             || self.total_tokens.is_some()
+    }
+
+    fn merge_from(&mut self, other: &TokenUsage) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+        if other.cached_input_tokens.is_some() {
+            self.cached_input_tokens = other.cached_input_tokens;
+        }
+        if other.cache_read_tokens.is_some() {
+            self.cache_read_tokens = other.cache_read_tokens;
+        }
+        if other.cache_write_tokens.is_some() {
+            self.cache_write_tokens = other.cache_write_tokens;
+        }
+        if other.total_tokens.is_some() {
+            self.total_tokens = other.total_tokens;
+        }
     }
 }
 
@@ -189,8 +210,8 @@ impl UsageRecorder for SeaOrmUsageRecorder {
                 usage_source: Set(record.usage_source.to_string()),
                 pricing_source: Set(record.pricing_source),
             };
-            active
-                .insert(&db)
+            usage_record::Entity::insert(active)
+                .exec_without_returning(&db)
                 .await
                 .context("failed to insert usage record")?;
             Ok(())
@@ -301,10 +322,9 @@ pub(super) fn calculate_cost(
     }
 
     let input_tokens = usage.input_tokens.unwrap_or(0);
-    let regular_input = input_tokens
-        .saturating_sub(cached_input)
-        .saturating_sub(cache_read)
-        .saturating_sub(cache_write);
+    // Only cached_input (OpenAI cached_tokens) is a subset of input_tokens; cache_read and
+    // cache_write are independent additive classes (Anthropic) and must not be subtracted.
+    let regular_input = input_tokens.saturating_sub(cached_input).max(0);
 
     let mut cost = token_cost(regular_input, price.input_per_1m);
     cost += token_cost(usage.output_tokens.unwrap_or(0), price.output_per_1m);
@@ -383,57 +403,67 @@ fn number(value: &Value, key: &str) -> Option<i64> {
 
 pub(super) struct UsageObserver {
     protocol: Protocol,
-    buffer: Vec<u8>,
+    line_buffer: Vec<u8>,
+    usage: TokenUsage,
+    seen_usage: bool,
 }
 
 impl UsageObserver {
     pub(super) fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
-            buffer: Vec::new(),
+            line_buffer: Vec::new(),
+            usage: TokenUsage::default(),
+            seen_usage: false,
         }
     }
 
     pub(super) fn feed(&mut self, chunk: &Bytes) {
-        self.buffer.extend_from_slice(chunk);
+        self.line_buffer.extend_from_slice(chunk);
+        while let Some(newline) = self.line_buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.line_buffer.drain(..=newline).collect::<Vec<u8>>();
+            self.consume_line(&line);
+        }
     }
 
-    pub(super) fn finish(&self) -> Option<TokenUsage> {
-        let text = std::str::from_utf8(&self.buffer).ok()?;
-        let mut latest = None;
-        for line in text.lines() {
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            let parsed =
-                match self.protocol {
-                    Protocol::OpenAi => value.get("usage").and_then(parse_openai_usage),
-                    Protocol::Anthropic => value
-                        .get("usage")
-                        .and_then(parse_anthropic_usage)
-                        .or_else(|| {
-                            value
-                                .pointer("/delta/usage")
-                                .and_then(parse_anthropic_usage)
-                        }),
-                };
-            if parsed.is_some() {
-                latest = parsed;
-            }
+    pub(super) fn finish(&mut self) -> Option<TokenUsage> {
+        if !self.line_buffer.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer);
+            self.consume_line(&line);
         }
-        latest
+        self.seen_usage.then(|| self.usage.clone())
+    }
+
+    fn consume_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Some(data) = line.trim_end().strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        let parsed = match self.protocol {
+            Protocol::OpenAi => value.get("usage").and_then(parse_openai_usage),
+            Protocol::Anthropic => value
+                .pointer("/message/usage")
+                .and_then(parse_anthropic_usage)
+                .or_else(|| value.get("usage").and_then(parse_anthropic_usage)),
+        };
+        if let Some(parsed) = parsed {
+            self.usage.merge_from(&parsed);
+            self.seen_usage = true;
+        }
     }
 }
 
 pub(super) fn warn_record_error(error: anyhow::Error) {
-    warn!(error = %error, "failed to record usage");
+    warn!(error = %error, error_chain = ?error, "failed to record usage");
 }
 
 pub mod usage_record {
@@ -540,7 +570,43 @@ mod tests {
 
         assert_eq!(currency, "USD");
         assert_eq!(source, Some("test".to_owned()));
-        assert_eq!(cost, Decimal::new(5265, 6));
+        assert_eq!(cost, Decimal::new(6465, 6));
+    }
+
+    #[test]
+    fn anthropic_cache_read_exceeding_input_stays_non_negative() {
+        let usage = TokenUsage {
+            input_tokens: Some(27586),
+            output_tokens: Some(387),
+            cache_read_tokens: Some(106262),
+            ..TokenUsage::default()
+        };
+
+        let (cost, _, _) = calculate_cost(
+            &pricing("anthropic", "sonnet"),
+            "anthropic",
+            Some("sonnet"),
+            &usage,
+        )
+        .unwrap();
+
+        assert!(cost >= Decimal::ZERO);
+    }
+
+    #[test]
+    fn openai_cached_tokens_are_subtracted_from_regular_input() {
+        let usage = TokenUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(400),
+            ..TokenUsage::default()
+        };
+
+        let (cost, _, _) =
+            calculate_cost(&pricing("openai", "gpt"), "openai", Some("gpt"), &usage).unwrap();
+
+        // regular input 600 * 3.00 + cached 400 * 0.30, all per 1M.
+        assert_eq!(cost, Decimal::new(192, 5));
     }
 
     #[test]
@@ -564,6 +630,56 @@ mod tests {
         };
 
         assert!(calculate_cost(&pricing, "openai", Some("gpt"), &usage).is_none());
+    }
+
+    #[test]
+    fn observer_merges_usage_fields_across_events() {
+        let mut observer = UsageObserver::new(Protocol::Anthropic);
+        observer.feed(&Bytes::from_static(
+            b"data: {\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n",
+        ));
+        observer.feed(&Bytes::from_static(
+            b"data: {\"usage\":{\"output_tokens\":270}}\n\n",
+        ));
+
+        let usage = observer.finish().unwrap();
+        assert_eq!(usage.input_tokens, Some(25));
+        assert_eq!(usage.output_tokens, Some(270));
+    }
+
+    #[test]
+    fn observer_reassembles_usage_line_split_across_chunks() {
+        let mut observer = UsageObserver::new(Protocol::OpenAi);
+        observer.feed(&Bytes::from_static(b"data: {\"usage\":{\"prompt_to"));
+        observer.feed(&Bytes::from_static(
+            b"kens\":100,\"completion_tokens\":25}}\n\n",
+        ));
+
+        let usage = observer.finish().unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(25));
+    }
+
+    #[test]
+    fn observer_parses_final_line_without_trailing_newline() {
+        let mut observer = UsageObserver::new(Protocol::OpenAi);
+        observer.feed(&Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}",
+        ));
+
+        let usage = observer.finish().unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn observer_without_usage_returns_none() {
+        let mut observer = UsageObserver::new(Protocol::OpenAi);
+        observer.feed(&Bytes::from_static(
+            b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+        ));
+
+        assert!(observer.finish().is_none());
     }
 
     #[test]

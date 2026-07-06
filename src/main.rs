@@ -1,10 +1,24 @@
 mod gateway;
 
+use std::fmt;
+
+use chrono::{FixedOffset, Utc};
 use tracing::{error, info};
+use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
+
+struct UtcPlus8Timer;
+
+impl FormatTime for UtcPlus8Timer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let offset = FixedOffset::east_opt(8 * 60 * 60).ok_or(fmt::Error)?;
+        let now = Utc::now().with_timezone(&offset);
+        write!(writer, "{}", now.format("%Y-%m-%dT%H:%M:%S%.6f%:z"))
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_timer(UtcPlus8Timer).init();
 
     start_web_server().await?;
 
