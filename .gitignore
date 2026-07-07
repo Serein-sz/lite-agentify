@@ -1,5 +1,10 @@
 /target
 
+# Frontend (ui/) build artifacts; dist keeps only .gitkeep for rust-embed
+/ui/node_modules/
+/ui/dist/*
+!/ui/dist/.gitkeep
+
 # Agent / tool config
 /.claude/
 /.codex/

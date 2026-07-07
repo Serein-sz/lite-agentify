@@ -1,4 +1,12 @@
-mod gateway;
+mod admin;
+mod config;
+mod domain;
+mod model;
+mod pricing;
+mod proxy;
+mod reload;
+mod state;
+mod usage;
 
 use std::fmt;
 
@@ -26,18 +34,23 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_web_server() -> anyhow::Result<()> {
-    let config_path = gateway::resolve_config_path();
-    let config = gateway::GatewayConfig::load_from_path(&config_path).inspect_err(|error| {
-        error!(%error, "failed to load gateway config");
-    })?;
+    let config_path = config::resolve_config_path();
+    let mut gateway_config =
+        config::GatewayConfig::load_from_path(&config_path).inspect_err(|error| {
+            error!(%error, "failed to load gateway config");
+        })?;
 
-    let listen_addr = config.listen_addr;
-    let (app, shared) = gateway::build_router(config, config_path)
+    // Hash a plaintext admin_password (rewriting the config file) before the
+    // watcher exists, so the write-back cannot trigger a spurious reload.
+    admin::bootstrap_admin_password(&mut gateway_config, &config_path);
+
+    let listen_addr = gateway_config.listen_addr;
+    let (app, shared) = proxy::build_router(gateway_config, config_path)
         .await
         .inspect_err(|error| {
             error!(%error, "failed to build gateway router");
         })?;
-    gateway::spawn_config_watcher(shared);
+    reload::spawn_config_watcher(shared);
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await

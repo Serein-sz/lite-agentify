@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>lite-agentify 管理台</title>
+    <script>
+      // 在首帧绘制前应用主题,避免暗色下刷新闪白。与 src/lib/theme.ts 保持一致。
+      (function () {
+        try {
+          var stored = localStorage.getItem("lite-agentify-theme");
+          var pref =
+            stored === "light" || stored === "dark" || stored === "system"
+              ? stored
+              : "system";
+          var dark =
+            pref === "dark" ||
+            (pref === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

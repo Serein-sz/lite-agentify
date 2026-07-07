@@ -1,5 +1,37 @@
 # lite-agentify
 
+## Admin Console
+
+A browser admin console lives under the reserved `/admin` prefix on the gateway's listen port: a usage dashboard (requests, tokens, cost, latency, error rate) and a config editor with save-and-hot-reload. `/admin` is gateway-owned path space — requests under it are never proxied upstream.
+
+### Enabling
+
+The console is disabled unless `admin_password` is set (everything under `/admin` returns 404). Add it as plaintext once:
+
+```toml
+admin_password = "choose-a-strong-password"
+```
+
+On the next startup the gateway replaces the value **in the config file** with its argon2id hash (comments and formatting are preserved). Logins verify against the hash; the plaintext is never stored again. If the file is read-only the gateway warns and continues with an in-memory hash — the plaintext stays on disk until the file becomes writable.
+
+### Security notes
+
+- Login sets an `HttpOnly`, `SameSite=Strict` session cookie scoped to `/admin` (24 h TTL, in-memory: restarting the gateway logs everyone out; hot reloads do not).
+- After 5 consecutive failed logins, all logins are rejected for 60 s — combined with argon2's slow verification this makes network brute force impractical.
+- The config editor implies custody of provider API keys (editing a `base_url` redirects traffic). Secrets are masked as `__MASKED__…` in the editor and round-trip unchanged; still, expose the port beyond localhost/LAN deliberately and firewall accordingly.
+- Config saves are validated first (invalid config → 400, file untouched), written atomically, hot-reloaded immediately, and rejected with 409 if the file changed on disk since it was loaded.
+
+### Building the console
+
+The frontend is a pnpm + Vite + React SPA in `ui/`, embedded into release binaries by rust-embed:
+
+```bash
+cd ui && pnpm install && pnpm build   # produces ui/dist
+cargo build --release                 # embeds ui/dist into the binary
+```
+
+Plain `cargo build` works without a frontend build (`ui/dist` ships only a `.gitkeep`; the console then serves a "assets not built" hint in debug). For frontend development run the gateway locally and `cd ui && pnpm dev` — Vite serves on :5173 and proxies `/admin/api` to the gateway, no Rust rebuild needed.
+
 ## Config Hot Reload
 
 The gateway reloads its config file at runtime without a restart. Two triggers share the same reload logic:
@@ -9,7 +41,7 @@ The gateway reloads its config file at runtime without a restart. Two triggers s
 
 Behavior:
 
-- Hot-reloadable fields: `providers` (including `model_aliases`), `routes`, `pricing`, `gateway_keys`.
+- Hot-reloadable fields: `providers` (including `model_aliases`), `routes`, `pricing`, `gateway_keys`, `admin_password`.
 - Not hot-reloadable: `listen_addr` and `usage_database` — changes are ignored with a warning log and require a restart; the remaining fields still take effect.
 - If the new config fails to parse or validate, the previous config keeps serving and the error is logged; the swap is atomic, so requests never see a partially applied config.
 - In-flight requests finish with the config snapshot they started with.
