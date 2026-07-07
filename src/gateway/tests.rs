@@ -19,7 +19,8 @@ use tower::ServiceExt;
 use super::{
     config::{GatewayConfig, PricingConfig, ProviderConfig, RouteConfig},
     model::{Protocol, default_listen_addr},
-    router::build_router_with_state,
+    reload::{self, SharedGatewayState},
+    router::{build_router_with_shared, build_router_with_state},
     state::GatewayState,
     upstream::{UpstreamClient, UpstreamFuture, UpstreamRequest, UpstreamResponse},
     usage::MemoryUsageRecorder,
@@ -1081,4 +1082,182 @@ fn empty_provider_chain_fails_startup() {
     config.routes[0].providers.clear();
 
     assert!(GatewayState::from_config(config).is_err());
+}
+
+// --- config hot reload ---
+
+/// Valid config whose gateway key, provider base URL, and alias differ from
+/// `config()` so tests can observe that a reload took effect.
+const RELOADED_CONFIG_TOML: &str = r#"
+listen_addr = "127.0.0.1:9"
+gateway_keys = ["gw-secret-v2"]
+
+[[providers]]
+id = "openai"
+protocol = "openai"
+base_url = "http://openai-v2.test"
+api_key = "openai-secret"
+
+[providers.model_aliases]
+public-chat = "gpt-v2"
+
+[[routes]]
+path_prefix = "/v1/chat/completions"
+providers = ["openai"]
+"#;
+
+fn write_temp_config(contents: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "lite-agentify-reload-test-{}.toml",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+fn shared_state_with_config_file(
+    client: Arc<dyn UpstreamClient>,
+    contents: &str,
+) -> SharedGatewayState {
+    let state = GatewayState::from_config_with_upstream(config(), client).unwrap();
+    SharedGatewayState::new(state, &config(), write_temp_config(contents))
+}
+
+async fn send_chat_with_key(app: axum::Router, key: &str, model: &str) -> Response<Body> {
+    app.oneshot(
+        HttpRequest::post("/v1/chat/completions")
+            .header(AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reload_applies_new_configuration() {
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client.clone(), RELOADED_CONFIG_TOML);
+
+    reload::reload(&shared).unwrap();
+
+    // New key, provider URL, and alias are live; the old key is rejected.
+    let app = build_router_with_shared(shared.clone());
+    let response = send_chat_with_key(app, "gw-secret-v2", "public-chat").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = client.last_request();
+    assert!(request.uri.to_string().starts_with("http://openai-v2.test"));
+    assert_eq!(body_model(&request.body), "gpt-v2");
+
+    let app = build_router_with_shared(shared);
+    let response = send_chat_with_key(app, "gw-secret", "public-chat").await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reload_with_invalid_toml_keeps_previous_configuration() {
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, "not valid toml ][");
+
+    assert!(reload::reload(&shared).is_err());
+
+    let response = send_chat(build_router_with_shared(shared)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reload_with_failing_validation_keeps_previous_configuration() {
+    // Parses as TOML but the route references an unknown provider.
+    let invalid = r#"
+gateway_keys = ["gw-secret-v2"]
+
+[[providers]]
+id = "openai"
+protocol = "openai"
+base_url = "http://openai-v2.test"
+api_key = "openai-secret"
+
+[[routes]]
+path_prefix = "/v1/chat/completions"
+providers = ["missing-provider"]
+"#;
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, invalid);
+
+    assert!(reload::reload(&shared).is_err());
+
+    let response = send_chat(build_router_with_shared(shared)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reload_ignores_listen_addr_and_usage_database_changes() {
+    // Changed listen_addr and a new usage_database block are warned about and
+    // skipped, while the reloadable fields still take effect.
+    let with_non_reloadable_changes =
+        format!("{RELOADED_CONFIG_TOML}\n[usage_database]\nurl = \"postgres://db.test/usage\"\n");
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, &with_non_reloadable_changes);
+
+    reload::reload(&shared).unwrap();
+
+    let response = send_chat_with_key(
+        build_router_with_shared(shared),
+        "gw-secret-v2",
+        "public-chat",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn post_reload(app: axum::Router, key: Option<&str>) -> Response<Body> {
+    let mut request = HttpRequest::post("/reload");
+    if let Some(key) = key {
+        request = request.header(AUTHORIZATION, format!("Bearer {key}"));
+    }
+    app.oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reload_endpoint_applies_new_configuration() {
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, RELOADED_CONFIG_TOML);
+
+    let response = post_reload(build_router_with_shared(shared.clone()), Some("gw-secret")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send_chat_with_key(
+        build_router_with_shared(shared),
+        "gw-secret-v2",
+        "public-chat",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reload_endpoint_reports_failure_and_keeps_serving() {
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, "not valid toml ][");
+
+    let response = post_reload(build_router_with_shared(shared.clone()), Some("gw-secret")).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let response = send_chat(build_router_with_shared(shared)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reload_endpoint_rejects_unauthenticated_request() {
+    let client = Arc::new(RecordingClient::default());
+    let shared = shared_state_with_config_file(client, RELOADED_CONFIG_TOML);
+
+    let response = post_reload(build_router_with_shared(shared.clone()), None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The reload must not have been triggered: the old key still works.
+    let response = send_chat(build_router_with_shared(shared)).await;
+    assert_eq!(response.status(), StatusCode::OK);
 }

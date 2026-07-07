@@ -51,7 +51,7 @@ pub struct RouteConfig {
     pub model_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct UsageDatabaseConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -92,11 +92,12 @@ impl GatewayConfig {
     }
 }
 
-pub fn load_config_from_env() -> anyhow::Result<GatewayConfig> {
-    let path = env::var(CONFIG_ENV_VAR)
+/// Resolves the config file path from the environment or the default location.
+/// Reload reuses the same path, so a process always reloads the file it booted from.
+pub fn resolve_config_path() -> PathBuf {
+    env::var(CONFIG_ENV_VAR)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| default_config_path());
-    GatewayConfig::load_from_path(path)
+        .unwrap_or_else(|_| default_config_path())
 }
 
 fn default_config_path() -> PathBuf {

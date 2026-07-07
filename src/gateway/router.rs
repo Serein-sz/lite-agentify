@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Mutex, time::Instant};
+use std::{path::PathBuf, str::FromStr, sync::Mutex, time::Instant};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -7,12 +7,12 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -21,6 +21,7 @@ use super::{
     headers::{is_response_header_forwardable, outbound_headers},
     model::{Protocol, Provider},
     pricing::calculate_cost,
+    reload::SharedGatewayState,
     state::GatewayState,
     upstream::{UpstreamRequest, UpstreamResponse},
     usage::{
@@ -29,28 +30,69 @@ use super::{
     },
 };
 
-pub async fn build_router(config: GatewayConfig) -> anyhow::Result<Router> {
+pub async fn build_router(
+    config: GatewayConfig,
+    config_path: PathBuf,
+) -> anyhow::Result<(Router, SharedGatewayState)> {
     let recorder = recorder_from_config(config.usage_database.as_ref()).await?;
     let state = GatewayState::from_config_with_upstream_and_recorder(
-        config,
+        config.clone(),
         std::sync::Arc::new(super::upstream::HyperUpstreamClient::new()),
         recorder,
     )?;
-    Ok(build_router_with_state(state))
+    let shared = SharedGatewayState::new(state, &config, config_path);
+    Ok((build_router_with_shared(shared.clone()), shared))
 }
 
+#[cfg(test)]
 pub(super) fn build_router_with_state(state: GatewayState) -> Router {
+    build_router_with_shared(SharedGatewayState::without_reload(state))
+}
+
+pub(super) fn build_router_with_shared(shared: SharedGatewayState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/reload", post(reload_endpoint))
         .fallback(any(proxy))
-        .with_state(state)
+        .with_state(shared)
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn proxy(State(state): State<GatewayState>, request: Request) -> Response {
+async fn reload_endpoint(State(shared): State<SharedGatewayState>, headers: HeaderMap) -> Response {
+    if !shared.load().is_authorized(&headers) {
+        warn!("rejected unauthenticated gateway reload request");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid gateway bearer token",
+        )
+            .into_response();
+    }
+
+    match super::reload::reload(&shared) {
+        Ok(()) => (StatusCode::OK, "gateway configuration reloaded").into_response(),
+        Err(reload_error) => {
+            error!(
+                error = format!("{reload_error:#}"),
+                "config reload via endpoint failed; keeping previous configuration"
+            );
+            // Top-level message only: full chains can quote config file
+            // contents (TOML snippets), which may contain secrets.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("configuration reload failed: {reload_error}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn proxy(State(shared): State<SharedGatewayState>, request: Request) -> Response {
+    // One snapshot per request: a concurrent reload swaps the shared pointer
+    // but never changes the state this request already resolved.
+    let state = shared.load();
     let started_at = Instant::now();
     let request_id = request_id(request.headers());
     let path = request.uri().path().to_owned();

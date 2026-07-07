@@ -26,14 +26,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_web_server() -> anyhow::Result<()> {
-    let config = gateway::load_config_from_env().inspect_err(|error| {
+    let config_path = gateway::resolve_config_path();
+    let config = gateway::GatewayConfig::load_from_path(&config_path).inspect_err(|error| {
         error!(%error, "failed to load gateway config");
     })?;
 
     let listen_addr = config.listen_addr;
-    let app = gateway::build_router(config).await.inspect_err(|error| {
-        error!(%error, "failed to build gateway router");
-    })?;
+    let (app, shared) = gateway::build_router(config, config_path)
+        .await
+        .inspect_err(|error| {
+            error!(%error, "failed to build gateway router");
+        })?;
+    gateway::spawn_config_watcher(shared);
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
