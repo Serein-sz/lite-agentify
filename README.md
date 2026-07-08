@@ -2,7 +2,11 @@
 
 ## Admin Console
 
-A browser admin console lives under the reserved `/admin` prefix on the gateway's listen port: a usage dashboard (requests, tokens, cost, latency, error rate) and a config editor with save-and-hot-reload. `/admin` is gateway-owned path space — requests under it are never proxied upstream.
+A browser admin console lives under the reserved `/admin` prefix on the gateway's listen port: a usage dashboard (requests, tokens, cost, latency, error rate) and a structured config editor with save-and-hot-reload. `/admin` is gateway-owned path space — requests under it are never proxied upstream.
+
+### Config editor
+
+The config page edits the hot-reloadable configuration as a structured form — `gateway_keys`, `providers` (including `model_aliases`), `routes`, and `pricing` — instead of raw TOML. Reference fields are guided: a route's providers are picked from the configured provider list (order = failover priority), and pricing rules choose a provider from that list or the `*` wildcard. Saves are reconciled into the on-disk TOML document, so comments and formatting on untouched entries survive. Restart-only settings (`listen_addr`, `usage_database`) and `admin_password` are not editable in the form — edit the file directly.
 
 ### Enabling
 
@@ -19,6 +23,7 @@ On the next startup the gateway replaces the value **in the config file** with i
 - Login sets an `HttpOnly`, `SameSite=Strict` session cookie scoped to `/admin` (24 h TTL, in-memory: restarting the gateway logs everyone out; hot reloads do not).
 - After 5 consecutive failed logins, all logins are rejected for 60 s — combined with argon2's slow verification this makes network brute force impractical.
 - The config editor implies custody of provider API keys (editing a `base_url` redirects traffic). Secrets are masked as `__MASKED__…` in the editor and round-trip unchanged; still, expose the port beyond localhost/LAN deliberately and firewall accordingly.
+- Each secret field has a copy button that fetches that one secret's plaintext on demand (`POST /admin/api/config/reveal`, session-gated, single field per request) and writes it to the clipboard. This is the only path where a plaintext secret reaches the browser — `GET /admin/api/config` always stays fully masked.
 - Config saves are validated first (invalid config → 400, file untouched), written atomically, hot-reloaded immediately, and rejected with 409 if the file changed on disk since it was loaded.
 
 ### Building the console

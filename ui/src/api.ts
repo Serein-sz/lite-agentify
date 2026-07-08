@@ -81,6 +81,42 @@ export interface ConfigPayload {
   hash: string;
 }
 
+/** 结构化配置 DTO,与后端 `StructuredConfig` 一致;密钥字段可携带 __MASKED__ 哨兵。 */
+export interface StructuredProvider {
+  id: string;
+  protocol: string;
+  base_url: string;
+  api_key: string;
+  anthropic_version?: string;
+  model_aliases: Record<string, string>;
+}
+
+export interface StructuredRoute {
+  path_prefix: string;
+  providers: string[];
+  model_prefix?: string;
+}
+
+/** 单价字段为字符串,后端按原文写入 TOML 以保留精度。 */
+export interface StructuredPricing {
+  provider: string;
+  model: string;
+  input_per_1m: string;
+  output_per_1m: string;
+  cached_input_per_1m?: string;
+  cache_read_per_1m?: string;
+  cache_write_per_1m?: string;
+  currency: string;
+  pricing_source?: string;
+}
+
+export interface StructuredConfig {
+  gateway_keys: string[];
+  providers: StructuredProvider[];
+  routes: StructuredRoute[];
+  pricing: StructuredPricing[];
+}
+
 export interface SaveResult {
   message: string;
   warnings: string[];
@@ -135,6 +171,16 @@ export const api = {
     request<SaveResult>("/config", {
       method: "PUT",
       body: JSON.stringify({ content, base_hash: baseHash }),
+    }),
+  putConfigStructured: (config: StructuredConfig, baseHash: string) =>
+    request<SaveResult>("/config/structured", {
+      method: "PUT",
+      body: JSON.stringify({ config, base_hash: baseHash }),
+    }),
+  revealSecret: (field: string) =>
+    request<{ value: string }>("/config/reveal", {
+      method: "POST",
+      body: JSON.stringify({ field }),
     }),
   usageSummary: (params: URLSearchParams) =>
     request<UsageSummaryResponse>(`/usage/summary?${params.toString()}`),

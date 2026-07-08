@@ -200,6 +200,48 @@ async fn put_config(app: &Router, token: &str, content: &str, base_hash: &str) -
     request(app, "PUT", "/admin/api/config", Some(token), Some(body)).await
 }
 
+async fn put_structured(
+    app: &Router,
+    token: &str,
+    config: serde_json::Value,
+    base_hash: &str,
+) -> Response<Body> {
+    let body = serde_json::json!({ "config": config, "base_hash": base_hash }).to_string();
+    request(
+        app,
+        "PUT",
+        "/admin/api/config/structured",
+        Some(token),
+        Some(body),
+    )
+    .await
+}
+
+/// The structured form state matching `config_toml`, every secret untouched
+/// (still the masked sentinel, as the form submits unedited secret fields).
+fn base_structured() -> serde_json::Value {
+    serde_json::json!({
+        "gateway_keys": ["__MASKED__"],
+        "providers": [{
+            "id": "openai",
+            "protocol": "openai",
+            "base_url": "http://openai.test",
+            "api_key": "__MASKED__",
+            "model_aliases": {}
+        }],
+        "routes": [{
+            "path_prefix": "/v1/chat/completions",
+            "providers": ["openai"]
+        }],
+        "pricing": []
+    })
+}
+
+async fn reveal(app: &Router, token: Option<&str>, field: &str) -> Response<Body> {
+    let body = serde_json::json!({ "field": field }).to_string();
+    request(app, "POST", "/admin/api/config/reveal", token, Some(body)).await
+}
+
 // --- password bootstrap (first-boot hash write-back) ---
 
 #[test]
@@ -556,6 +598,215 @@ async fn put_reports_restart_required_warnings() {
             .iter()
             .any(|warning| warning.as_str().unwrap().contains("listen_addr"))
     );
+}
+
+// --- structured config write API ---
+
+#[tokio::test]
+async fn structured_field_edit_preserves_comments_and_masked_secrets() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+
+    let mut config = base_structured();
+    config["providers"][0]["base_url"] = "http://openai-new.test".into();
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let disk = std::fs::read_to_string(&harness.config_path).unwrap();
+    assert!(disk.contains("http://openai-new.test"));
+    // Comments on surviving nodes are preserved, including the one on the
+    // same line as the (untouched, sentinel-submitted) secret.
+    assert!(disk.contains("# top comment preserved"));
+    assert!(disk.contains("# keep my key comment"));
+    // Masked sentinels round-trip to the on-disk secrets.
+    assert!(disk.contains("openai-secret-key"));
+    assert!(disk.contains("gw-secret-key-1"));
+    assert!(!disk.contains("__MASKED__"));
+    // Untouched sections survive the reconcile.
+    assert!(disk.contains("postgres://user:dbpass@localhost/usage"));
+    assert!(disk.contains(ADMIN_PASSWORD));
+}
+
+#[tokio::test]
+async fn structured_added_provider_persists_and_activates() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+
+    let mut config = base_structured();
+    config["providers"].as_array_mut().unwrap().push(serde_json::json!({
+        "id": "anthropic",
+        "protocol": "anthropic",
+        "base_url": "http://anthropic.test",
+        "api_key": "anthropic-real-key",
+        "anthropic_version": "2023-06-01",
+        "model_aliases": { "claude": "claude-real" }
+    }));
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let disk = std::fs::read_to_string(&harness.config_path).unwrap();
+    assert!(disk.contains("anthropic-real-key"));
+    assert!(disk.contains("claude-real"));
+    // Live without a restart.
+    assert!(harness.shared.load().providers.contains_key("anthropic"));
+}
+
+#[tokio::test]
+async fn structured_removed_entries_are_deleted() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+
+    // Replace the openai provider with a new one (at least one provider and
+    // one route must remain for the config to validate).
+    let mut config = base_structured();
+    config["providers"] = serde_json::json!([{
+        "id": "backup",
+        "protocol": "openai",
+        "base_url": "http://backup.test",
+        "api_key": "backup-real-key",
+        "model_aliases": {}
+    }]);
+    config["routes"][0]["providers"] = serde_json::json!(["backup"]);
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let disk = std::fs::read_to_string(&harness.config_path).unwrap();
+    assert!(!disk.contains("id = \"openai\""));
+    assert!(!disk.contains("openai-secret-key"));
+    assert!(disk.contains("id = \"backup\""));
+    assert!(!harness.shared.load().providers.contains_key("openai"));
+    assert!(harness.shared.load().providers.contains_key("backup"));
+}
+
+#[tokio::test]
+async fn structured_invalid_config_is_rejected_and_file_unchanged() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+    let before = std::fs::read(&harness.config_path).unwrap();
+
+    let mut config = base_structured();
+    config["routes"][0]["providers"] = serde_json::json!(["missing"]);
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(std::fs::read(&harness.config_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn structured_stale_hash_conflicts_and_file_unchanged() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let before = std::fs::read(&harness.config_path).unwrap();
+
+    let response = put_structured(&harness.app, &token, base_structured(), "stale-hash").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = body_json(response).await;
+    assert!(json["content"].as_str().unwrap().contains("__MASKED__"));
+    assert!(json["hash"].as_str().is_some());
+    assert_eq!(std::fs::read(&harness.config_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn structured_changed_secret_persists_and_activates() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+
+    let mut config = base_structured();
+    config["providers"][0]["api_key"] = "new-structured-secret".into();
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let disk = std::fs::read_to_string(&harness.config_path).unwrap();
+    assert!(disk.contains("new-structured-secret"));
+    assert!(!disk.contains("openai-secret-key"));
+    assert_eq!(
+        harness.shared.load().providers.get("openai").unwrap().api_key,
+        "new-structured-secret"
+    );
+}
+
+#[tokio::test]
+async fn structured_put_adds_pricing_entry() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+    let (_, hash) = get_config_payload(&harness.app, &token).await;
+
+    let mut config = base_structured();
+    config["pricing"] = serde_json::json!([{
+        "provider": "*",
+        "model": "*",
+        "input_per_1m": "2.00",
+        "output_per_1m": "8.00",
+        "cached_input_per_1m": "0.50",
+        "currency": "USD"
+    }]);
+    let response = put_structured(&harness.app, &token, config, &hash).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let disk = std::fs::read_to_string(&harness.config_path).unwrap();
+    assert!(disk.contains("[[pricing]]"));
+    assert!(disk.contains("\"2.00\""));
+}
+
+// --- secret reveal API ---
+
+#[tokio::test]
+async fn reveal_returns_the_single_requested_secret() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+
+    let response = reveal(&harness.app, Some(&token), "providers.openai.api_key").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["value"], "openai-secret-key");
+    // Exactly one field in the response: no other secret rides along.
+    assert_eq!(json.as_object().unwrap().len(), 1);
+
+    let response = reveal(&harness.app, Some(&token), "gateway_keys.0").await;
+    assert_eq!(body_json(response).await["value"], "gw-secret-key-1");
+
+    let response = reveal(&harness.app, Some(&token), "usage_database.url").await;
+    assert_eq!(
+        body_json(response).await["value"],
+        "postgres://user:dbpass@localhost/usage"
+    );
+}
+
+#[tokio::test]
+async fn reveal_requires_a_session() {
+    let harness = harness();
+
+    let response = reveal(&harness.app, None, "providers.openai.api_key").await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reveal_unknown_reference_is_404() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+
+    let response = reveal(&harness.app, Some(&token), "providers.missing.api_key").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = reveal(&harness.app, Some(&token), "gateway_keys.9").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reveal_non_secret_reference_is_400() {
+    let harness = harness();
+    let token = login_token(&harness.app).await;
+
+    for field in ["listen_addr", "providers.openai.base_url", "admin_password"] {
+        let response = reveal(&harness.app, Some(&token), field).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "field: {field}");
+        let json = body_json(response).await;
+        assert!(json.get("value").is_none());
+    }
 }
 
 // --- usage query API ---

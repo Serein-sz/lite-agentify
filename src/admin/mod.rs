@@ -18,7 +18,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use tracing::warn;
@@ -168,6 +168,11 @@ fn admin_router_with_state(state: AdminState) -> Router {
             "/api/config",
             get(config_api::get_config).put(config_api::put_config),
         )
+        .route(
+            "/api/config/structured",
+            put(config_api::put_config_structured),
+        )
+        .route("/api/config/reveal", post(config_api::reveal_secret))
         .route("/api/usage", get(usage_api::list_usage))
         .route("/api/usage/summary", get(usage_api::usage_summary))
         .route("/api/logout", post(logout))
