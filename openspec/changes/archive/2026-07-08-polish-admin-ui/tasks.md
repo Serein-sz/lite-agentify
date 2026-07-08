@@ -28,7 +28,7 @@
 
 - [x] 5.1 Add the `AnimatedGridPattern` full-screen backdrop with foreground low-opacity highlights (both schemes, no hue)
 - [x] 5.2 Wrap the login card with `ShineBorder` using a neutral gradient; verify the form (autofocus, submit, error states) is unaffected
-- [ ] 5.3 Visual pass on the login page in light and dark modes
+- [x] 5.3 Visual pass on the login page in light and dark modes
 
 ## 6. Dashboard
 
@@ -44,8 +44,8 @@
 
 ## 8. Verification
 
-- [ ] 8.1 Light/dark visual pass across login, dashboard, config: achromatic surfaces, semantic badge colors intact, chart series distinguishable in both schemes (spec scenarios for palette and chart legibility)
-- [ ] 8.2 Reduced-motion pass (DevTools emulation): static login backdrop, no entrance transitions, instant final stat values (spec reduced-motion scenarios)
-- [ ] 8.3 Confirm no perpetual decorative animation on authenticated pages after entrance settles (spec post-login motion scenarios)
-- [ ] 8.4 `pnpm build` in `ui/` passes (tsc + vite); note `dist/` gzip size before/after to record the motion bundle cost
-- [ ] 8.5 Rebuild the gateway and verify `/admin` serves the new UI from embedded assets
+- [x] 8.1 Light/dark visual pass across login, dashboard, config: achromatic surfaces, semantic badge colors intact, chart series distinguishable in both schemes (spec scenarios for palette and chart legibility)
+- [x] 8.2 Reduced-motion pass (DevTools emulation): static login backdrop, no entrance transitions, instant final stat values (spec reduced-motion scenarios)
+- [x] 8.3 Confirm no perpetual decorative animation on authenticated pages after entrance settles (spec post-login motion scenarios)
+- [x] 8.4 `pnpm build` in `ui/` passes (tsc + vite); note `dist/` gzip size before/after to record the motion bundle cost — JS 1,587,532 B → 1,726,830 B raw (gzip 564 KB); +~139 KB for the motion layer
+- [x] 8.5 Rebuild the gateway and verify `/admin` serves the new UI from embedded assets
