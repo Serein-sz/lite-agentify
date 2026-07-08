@@ -1,5 +1,6 @@
 import { NavLink, Outlet, Route, Routes, useNavigate } from "react-router";
 import { useMutation } from "@tanstack/react-query";
+import { Waypoints } from "lucide-react";
 import { api } from "./api";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -15,7 +16,7 @@ function TabLink({ to, label }: { to: string; label: string }) {
       end={to === "/"}
       className={({ isActive }) =>
         cn(
-          "inline-flex h-7 items-center px-2.5 text-xs font-medium transition-colors",
+          "inline-flex h-7 items-center rounded-full px-3 text-xs font-medium transition-colors",
           isActive
             ? "bg-primary text-primary-foreground"
             : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -36,9 +37,12 @@ function Layout() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border bg-card">
+      <header className="sticky top-0 z-40 border-b border-border bg-card/80 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center gap-6 px-6 py-3">
-          <span className="text-sm font-semibold tracking-tight">
+          <span className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+            <span className="flex size-6 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <Waypoints className="size-3.5" />
+            </span>
             lite-agentify
           </span>
           <nav className="flex gap-1">

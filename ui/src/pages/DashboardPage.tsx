@@ -9,6 +9,8 @@ import {
 import type { EChartsOption } from "echarts";
 import { api, type UsageRow } from "@/api";
 import { EChart } from "@/components/EChart";
+import { BlurFade } from "@/components/magicui/blur-fade";
+import { NumberTicker } from "@/components/magicui/number-ticker";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -59,13 +61,34 @@ const STATUS_OPTIONS = [
 
 const PAGE_SIZE = 20;
 
-function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+function StatCard({
+  title,
+  value,
+  format,
+  sub,
+}: {
+  title: string;
+  /** 数值走 NumberTicker 滚动;无法压成单一数值时传字符串静态展示。 */
+  value: number | string;
+  format?: (value: number) => string;
+  sub?: string;
+}) {
   return (
     <Card size="sm">
       <CardHeader>
         <CardDescription>{title}</CardDescription>
-        <CardTitle className="truncate text-lg">{value}</CardTitle>
-        {sub && <CardDescription className="text-xs">{sub}</CardDescription>}
+        <CardTitle className="truncate text-lg tabular-nums">
+          {typeof value === "number" ? (
+            <NumberTicker value={value} format={format} />
+          ) : (
+            value
+          )}
+        </CardTitle>
+        {sub && (
+          <CardDescription className="text-xs tabular-nums">
+            {sub}
+          </CardDescription>
+        )}
       </CardHeader>
     </Card>
   );
@@ -91,7 +114,7 @@ const logColumns = [
   columnHelper.accessor("created_at", {
     header: "时间",
     cell: (info) => (
-      <span className="whitespace-nowrap text-muted-foreground">
+      <span className="whitespace-nowrap text-muted-foreground tabular-nums">
         {formatDateTime(info.getValue())}
       </span>
     ),
@@ -109,7 +132,11 @@ const logColumns = [
     header: "Tokens",
     cell: (info) => {
       const value = info.getValue();
-      return value === null ? "—" : formatTokens(value);
+      return value === null ? (
+        "—"
+      ) : (
+        <span className="tabular-nums">{formatTokens(value)}</span>
+      );
     },
   }),
   columnHelper.accessor(
@@ -117,11 +144,17 @@ const logColumns = [
       row.estimated_cost === null
         ? "—"
         : `${Number(row.estimated_cost).toLocaleString("zh-CN", { maximumFractionDigits: 4 })} ${row.currency ?? ""}`,
-    { id: "cost", header: "成本" },
+    {
+      id: "cost",
+      header: "成本",
+      cell: (info) => <span className="tabular-nums">{info.getValue()}</span>,
+    },
   ),
   columnHelper.accessor("latency_ms", {
     header: "延迟",
-    cell: (info) => formatLatency(info.getValue()),
+    cell: (info) => (
+      <span className="tabular-nums">{formatLatency(info.getValue())}</span>
+    ),
   }),
 ];
 
@@ -142,6 +175,8 @@ export default function DashboardPage() {
 
   const summaryQuery = useQuery({
     queryKey: ["usage-summary", from, range.bucket],
+    // 切范围时保留旧数据:页面不闪加载态,数字从旧值滚向新值。
+    placeholderData: keepPreviousData,
     queryFn: () =>
       api.usageSummary(new URLSearchParams({ from, bucket: range.bucket })),
   });
@@ -221,6 +256,8 @@ export default function DashboardPage() {
           type: "line",
           yAxisIndex: 1,
           smooth: true,
+          // 主指标线加粗:无彩体系里层级靠明度与笔重。
+          lineStyle: { width: 3 },
           data: series.map((point) => costAmount(point.cost, primaryCurrency)),
         },
       ],
@@ -256,6 +293,11 @@ export default function DashboardPage() {
   }
 
   const totals = summary!.totals;
+  // 成本能压成单一主币种数值时才滚动;混合币种退化为静态文本(正确优先于动效)。
+  const costValue: number | string =
+    totals.cost.length === 1
+      ? costAmount(totals.cost, primaryCurrency)
+      : formatCost(totals.cost);
 
   return (
     <div className="space-y-6">
@@ -278,196 +320,221 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <StatCard title="请求数" value={formatNumber(totals.requests)} />
+      <BlurFade className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        <StatCard
+          title="请求数"
+          value={totals.requests}
+          format={(count) => formatNumber(Math.round(count))}
+        />
         <StatCard
           title="Tokens"
-          value={formatTokens(totals.total_tokens)}
+          value={totals.total_tokens}
+          format={formatTokens}
           sub={`输入 ${formatTokens(totals.input_tokens)} / 输出 ${formatTokens(totals.output_tokens)}`}
         />
-        <StatCard title="成本" value={formatCost(totals.cost)} />
-        <StatCard title="平均延迟" value={formatLatency(totals.avg_latency_ms)} />
-        <StatCard title="错误率" value={formatPercent(totals.error_rate)} />
-      </div>
+        <StatCard
+          title="成本"
+          value={costValue}
+          format={(amount) =>
+            `${amount.toLocaleString("zh-CN", { maximumFractionDigits: 4 })} ${primaryCurrency ?? ""}`
+          }
+        />
+        <StatCard
+          title="平均延迟"
+          value={totals.avg_latency_ms}
+          format={formatLatency}
+        />
+        <StatCard
+          title="错误率"
+          value={totals.error_rate}
+          format={formatPercent}
+        />
+      </BlurFade>
 
       <div className="grid gap-4 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle>用量趋势</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <EChart option={chartOption} height={300} />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Provider × 模型</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Provider / 模型</TableHead>
-                  <TableHead className="text-right">请求</TableHead>
-                  <TableHead className="text-right">成本</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {summary!.breakdown
-                  .slice()
-                  .sort(
-                    (a, b) =>
-                      costAmount(b.cost, primaryCurrency) -
-                      costAmount(a.cost, primaryCurrency),
-                  )
-                  .map((row) => (
-                    <TableRow key={`${row.provider_id}:${row.model ?? ""}`}>
-                      <TableCell>
-                        <span className="font-medium">{row.provider_id}</span>
-                        <span className="text-muted-foreground">
-                          {" "}
-                          / {row.model ?? "—"}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatNumber(row.requests)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatCost(row.cost)}
+        <BlurFade className="lg:col-span-2" delay={0.06}>
+          <Card className="h-full">
+            <CardHeader>
+              <CardTitle>用量趋势</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <EChart option={chartOption} height={300} />
+            </CardContent>
+          </Card>
+        </BlurFade>
+        <BlurFade delay={0.12}>
+          <Card className="h-full">
+            <CardHeader>
+              <CardTitle>Provider × 模型</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Provider / 模型</TableHead>
+                    <TableHead className="text-right">请求</TableHead>
+                    <TableHead className="text-right">成本</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {summary!.breakdown
+                    .slice()
+                    .sort(
+                      (a, b) =>
+                        costAmount(b.cost, primaryCurrency) -
+                        costAmount(a.cost, primaryCurrency),
+                    )
+                    .map((row) => (
+                      <TableRow key={`${row.provider_id}:${row.model ?? ""}`}>
+                        <TableCell>
+                          <span className="font-medium">{row.provider_id}</span>
+                          <span className="text-muted-foreground">
+                            {" "}
+                            / {row.model ?? "—"}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {formatNumber(row.requests)}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {formatCost(row.cost)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  {summary!.breakdown.length === 0 && (
+                    <TableRow>
+                      <TableCell
+                        colSpan={3}
+                        className="py-6 text-center text-muted-foreground"
+                      >
+                        该时间段暂无数据
                       </TableCell>
                     </TableRow>
-                  ))}
-                {summary!.breakdown.length === 0 && (
+                  )}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </BlurFade>
+      </div>
+
+      <BlurFade delay={0.18}>
+        <Card>
+          <CardHeader>
+            <CardTitle>请求明细</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="ml-auto flex items-center gap-2">
+                <Input
+                  value={providerInput}
+                  onChange={(event) => setProviderInput(event.target.value)}
+                  onBlur={() => {
+                    setProviderFilter(providerInput.trim());
+                    setPage(1);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      setProviderFilter(providerInput.trim());
+                      setPage(1);
+                    }
+                  }}
+                  placeholder="按 provider 筛选"
+                  className="w-44"
+                />
+                <Select
+                  value={statusFilter}
+                  onValueChange={(value) => {
+                    setStatusFilter(String(value));
+                    setPage(1);
+                  }}
+                >
+                  <SelectTrigger className="w-28">
+                    <SelectValue>
+                      {
+                        STATUS_OPTIONS.find(
+                          (option) => option.value === statusFilter,
+                        )?.label
+                      }
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STATUS_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <Table>
+              <TableHeader>
+                {table.getHeaderGroups().map((headerGroup) => (
+                  <TableRow key={headerGroup.id}>
+                    {headerGroup.headers.map((header) => (
+                      <TableHead key={header.id}>
+                        {flexRender(
+                          header.column.columnDef.header,
+                          header.getContext(),
+                        )}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                ))}
+              </TableHeader>
+              <TableBody>
+                {table.getRowModel().rows.map((row) => (
+                  <TableRow key={row.id}>
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell key={cell.id}>
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+                {rows.length === 0 && (
                   <TableRow>
                     <TableCell
-                      colSpan={3}
-                      className="py-6 text-center text-muted-foreground"
+                      colSpan={logColumns.length}
+                      className="py-8 text-center text-muted-foreground"
                     >
-                      该时间段暂无数据
+                      {listQuery.isPending ? "加载中…" : "该条件下暂无请求记录"}
                     </TableCell>
                   </TableRow>
                 )}
               </TableBody>
             </Table>
+
+            <div className="flex items-center gap-3 text-xs text-muted-foreground">
+              <span className="tabular-nums">
+                共 {formatNumber(total)} 条 · 第 {page} / {pageCount} 页
+              </span>
+              <div className="ml-auto flex gap-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage((current) => Math.max(1, current - 1))}
+                  disabled={page <= 1}
+                >
+                  上一页
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setPage((current) => Math.min(pageCount, current + 1))
+                  }
+                  disabled={page >= pageCount}
+                >
+                  下一页
+                </Button>
+              </div>
+            </div>
           </CardContent>
         </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>请求明细</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="ml-auto flex items-center gap-2">
-              <Input
-                value={providerInput}
-                onChange={(event) => setProviderInput(event.target.value)}
-                onBlur={() => {
-                  setProviderFilter(providerInput.trim());
-                  setPage(1);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    setProviderFilter(providerInput.trim());
-                    setPage(1);
-                  }
-                }}
-                placeholder="按 provider 筛选"
-                className="w-44"
-              />
-              <Select
-                value={statusFilter}
-                onValueChange={(value) => {
-                  setStatusFilter(String(value));
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="w-28">
-                  <SelectValue>
-                    {
-                      STATUS_OPTIONS.find(
-                        (option) => option.value === statusFilter,
-                      )?.label
-                    }
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {STATUS_OPTIONS.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <Table>
-            <TableHeader>
-              {table.getHeaderGroups().map((headerGroup) => (
-                <TableRow key={headerGroup.id}>
-                  {headerGroup.headers.map((header) => (
-                    <TableHead key={header.id}>
-                      {flexRender(
-                        header.column.columnDef.header,
-                        header.getContext(),
-                      )}
-                    </TableHead>
-                  ))}
-                </TableRow>
-              ))}
-            </TableHeader>
-            <TableBody>
-              {table.getRowModel().rows.map((row) => (
-                <TableRow key={row.id}>
-                  {row.getVisibleCells().map((cell) => (
-                    <TableCell key={cell.id}>
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </TableCell>
-                  ))}
-                </TableRow>
-              ))}
-              {rows.length === 0 && (
-                <TableRow>
-                  <TableCell
-                    colSpan={logColumns.length}
-                    className="py-8 text-center text-muted-foreground"
-                  >
-                    {listQuery.isPending ? "加载中…" : "该条件下暂无请求记录"}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            <span>
-              共 {formatNumber(total)} 条 · 第 {page} / {pageCount} 页
-            </span>
-            <div className="ml-auto flex gap-1">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((current) => Math.max(1, current - 1))}
-                disabled={page <= 1}
-              >
-                上一页
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  setPage((current) => Math.min(pageCount, current + 1))
-                }
-                disabled={page >= pageCount}
-              >
-                下一页
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+      </BlurFade>
     </div>
   );
 }

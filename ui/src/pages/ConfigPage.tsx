@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PlusIcon, Trash2Icon } from "lucide-react";
 import { ApiError, api, type ConfigPayload } from "@/api";
+import { BlurFade } from "@/components/magicui/blur-fade";
 import { Button } from "@/components/ui/button";
 import { SecretInput } from "./config/fields";
 import {
@@ -161,32 +162,42 @@ export default function ConfigPage() {
         </div>
       )}
 
-      <GatewayKeysSection
-        entries={form.gatewayKeys}
-        onChange={(gatewayKeys) => update({ ...form, gatewayKeys })}
-      />
-      <ProvidersSection
-        providers={form.providers}
-        onChange={(providers) => update({ ...form, providers })}
-      />
-      <RoutesSection
-        routes={form.routes}
-        providerIds={form.providers.map((provider) => provider.id).filter(Boolean)}
-        onChange={(routes) => update({ ...form, routes })}
-      />
-      <PricingSection
-        pricing={form.pricing}
-        providers={form.providers}
-        onChange={(pricing) => update({ ...form, pricing })}
-      />
+      <BlurFade>
+        <GatewayKeysSection
+          entries={form.gatewayKeys}
+          onChange={(gatewayKeys) => update({ ...form, gatewayKeys })}
+        />
+      </BlurFade>
+      <BlurFade delay={0.06}>
+        <ProvidersSection
+          providers={form.providers}
+          onChange={(providers) => update({ ...form, providers })}
+        />
+      </BlurFade>
+      <BlurFade delay={0.12}>
+        <RoutesSection
+          routes={form.routes}
+          providerIds={form.providers.map((provider) => provider.id).filter(Boolean)}
+          onChange={(routes) => update({ ...form, routes })}
+        />
+      </BlurFade>
+      <BlurFade delay={0.18}>
+        <PricingSection
+          pricing={form.pricing}
+          providers={form.providers}
+          onChange={(pricing) => update({ ...form, pricing })}
+        />
+      </BlurFade>
 
-      <section className="space-y-2 border-t border-border pt-4 text-xs text-muted-foreground">
-        <p>
-          管理密码 admin_password:
-          {form.adminPasswordSet ? "已设置(单向哈希,不支持在此修改)" : "未设置"}
-        </p>
-        <p>listen_addr 与 usage_database 需重启生效,请直接编辑配置文件。</p>
-      </section>
+      <BlurFade delay={0.24}>
+        <section className="space-y-2 border-t border-border pt-4 text-xs text-muted-foreground">
+          <p>
+            管理密码 admin_password:
+            {form.adminPasswordSet ? "已设置(单向哈希,不支持在此修改)" : "未设置"}
+          </p>
+          <p>listen_addr 与 usage_database 需重启生效,请直接编辑配置文件。</p>
+        </section>
+      </BlurFade>
     </div>
   );
 }

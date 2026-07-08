@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useNavigate } from "react-router";
 import { useMutation } from "@tanstack/react-query";
 import { ApiError, api } from "@/api";
+import { AnimatedGridPattern } from "@/components/magicui/animated-grid-pattern";
+import { ShineBorder } from "@/components/magicui/shine-border";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -32,8 +34,15 @@ export default function LoginPage() {
   });
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <Card className="w-full max-w-sm">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background">
+      <AnimatedGridPattern
+        numSquares={36}
+        maxOpacity={0.08}
+        duration={3}
+        className="fill-foreground/10 stroke-foreground/10 [mask-image:radial-gradient(600px_circle_at_center,white,transparent)]"
+      />
+      <Card className="relative w-full max-w-sm overflow-hidden">
+        <ShineBorder shineColor="var(--foreground)" duration={12} />
         <CardHeader>
           <CardTitle className="text-base">lite-agentify 管理台</CardTitle>
           <CardDescription>输入配置文件中设置的管理密码</CardDescription>
