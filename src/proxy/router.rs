@@ -1,4 +1,9 @@
-use std::{path::PathBuf, str::FromStr, sync::Mutex, time::Instant};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -145,13 +150,18 @@ async fn proxy(State(shared): State<SharedGatewayState>, request: Request) -> Re
     let mut last_error: Option<Response> = None;
     let mut unresolved_model_alias = false;
 
-    for provider_id in &route.provider_ids {
+    let provider_count = route.provider_ids.len();
+    for (index, provider_id) in route.provider_ids.iter().enumerate() {
         let Some(provider) = state.provider(provider_id) else {
             // from_config guarantees every id resolves; skip defensively.
             continue;
         };
 
-        match ctx.attempt_provider(provider).await {
+        // The last provider in the chain has nowhere to fail over to, so a
+        // provider that exhausts its rate-limit retries forwards its real
+        // response (e.g. 429) to the client instead of a synthesized 502.
+        let is_last = index + 1 == provider_count;
+        match ctx.attempt_provider(provider, is_last).await {
             ProviderAttempt::Forward(response) => return response,
             ProviderAttempt::Failover(response) => last_error = Some(response),
             ProviderAttempt::AliasMissing => unresolved_model_alias = true,
@@ -196,7 +206,11 @@ struct ProxyContext<'a> {
 }
 
 impl ProxyContext<'_> {
-    async fn attempt_provider(&self, provider: &Provider) -> ProviderAttempt {
+    /// Attempts one provider, retrying it in place on a configured rate-limit
+    /// status (default 429/529) with backoff before giving up. `is_last`
+    /// forwards an exhausted rate-limit response to the client rather than
+    /// failing over to a non-existent next provider.
+    async fn attempt_provider(&self, provider: &Provider, is_last: bool) -> ProviderAttempt {
         let request_id = self.request_id;
         let path = self.path;
 
@@ -239,51 +253,137 @@ impl ProxyContext<'_> {
             }
         };
 
-        let result = self
-            .state
-            .upstream
-            .send(UpstreamRequest {
-                method: self.method.clone(),
-                uri: upstream_uri,
-                headers,
-                body: provider_body.body.clone(),
-            })
-            .await;
+        let retry = &self.state.retry_policy;
+        // 0-based retry index; attempt 0 is the initial try. Bounded by
+        // `max_attempts` (validated >= 1 at startup).
+        for attempt in 0..retry.max_attempts {
+            let result = self
+                .state
+                .upstream
+                .send(UpstreamRequest {
+                    method: self.method.clone(),
+                    uri: upstream_uri.clone(),
+                    headers: headers.clone(),
+                    body: provider_body.body.clone(),
+                })
+                .await;
 
-        match result {
-            Ok(upstream) if upstream.status.is_server_error() => {
+            let upstream = match result {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    // Transport errors fail over immediately, never retried
+                    // against the same provider.
+                    warn!(
+                        %request_id,
+                        provider = %provider.id,
+                        protocol = %provider.protocol,
+                        %path,
+                        error = %error,
+                        latency_ms = self.started_at.elapsed().as_millis(),
+                        "upstream llm request failed, trying next provider in chain"
+                    );
+                    return ProviderAttempt::Failover(
+                        (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+                    );
+                }
+            };
+
+            let status = upstream.status;
+            let is_retryable = retry.is_retryable(status.as_u16());
+
+            // 5xx fails over immediately (no same-provider retry), as before —
+            // unless the status is explicitly configured as retryable (e.g. the
+            // 529 "overloaded" code), which takes the backoff path below.
+            if status.is_server_error() && !is_retryable {
                 warn!(
                     %request_id,
                     provider = %provider.id,
                     protocol = %provider.protocol,
                     %path,
-                    status = upstream.status.as_u16(),
+                    status = status.as_u16(),
                     latency_ms = self.started_at.elapsed().as_millis(),
                     "provider returned server error, trying next provider in chain"
                 );
-                ProviderAttempt::Failover(
+                return ProviderAttempt::Failover(
                     (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
-                )
+                );
             }
-            Ok(upstream) => ProviderAttempt::Forward(
-                self.forward_upstream_response(provider, provider_body, upstream)
-                    .await,
-            ),
-            Err(error) => {
+
+            // A configured rate-limit status is retried against the same
+            // provider with backoff until attempts are exhausted.
+            if is_retryable {
+                let is_final_attempt = attempt + 1 >= retry.max_attempts;
+                if is_final_attempt {
+                    if is_last {
+                        // Nowhere left to fail over; return the real response.
+                        info!(
+                            %request_id,
+                            provider = %provider.id,
+                            %path,
+                            status = status.as_u16(),
+                            attempts = attempt + 1,
+                            "rate-limit retries exhausted on last provider, forwarding response to client"
+                        );
+                        return ProviderAttempt::Forward(
+                            self.forward_upstream_response(provider, provider_body, upstream)
+                                .await,
+                        );
+                    }
+                    warn!(
+                        %request_id,
+                        provider = %provider.id,
+                        %path,
+                        status = status.as_u16(),
+                        attempts = attempt + 1,
+                        "rate-limit retries exhausted, trying next provider in chain"
+                    );
+                    return ProviderAttempt::Failover(
+                        (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+                    );
+                }
+
+                let delay = self.backoff_delay(retry, attempt, &upstream.headers);
                 warn!(
                     %request_id,
                     provider = %provider.id,
-                    protocol = %provider.protocol,
                     %path,
-                    error = %error,
-                    latency_ms = self.started_at.elapsed().as_millis(),
-                    "upstream llm request failed, trying next provider in chain"
+                    status = status.as_u16(),
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis(),
+                    "provider rate-limited, backing off before retrying same provider"
                 );
-                ProviderAttempt::Failover(
-                    (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
-                )
+                // Drop the rate-limit response body before waiting.
+                drop(upstream);
+                tokio::time::sleep(delay).await;
+                continue;
             }
+
+            // 2xx / 3xx / non-retryable 4xx: forward to the client.
+            return ProviderAttempt::Forward(
+                self.forward_upstream_response(provider, provider_body, upstream)
+                    .await,
+            );
         }
+
+        // Unreachable: the loop returns on every path when max_attempts >= 1,
+        // which startup validation guarantees. Fail over defensively.
+        ProviderAttempt::Failover(
+            (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+        )
+    }
+
+    /// The wait before the next same-provider retry: a capped `Retry-After`
+    /// header when present, otherwise full-jitter exponential backoff.
+    fn backoff_delay(
+        &self,
+        retry: &crate::model::RetryPolicy,
+        attempt: u32,
+        headers: &HeaderMap,
+    ) -> Duration {
+        if let Some(retry_after_ms) = parse_retry_after_ms(headers) {
+            return Duration::from_millis(retry.cap_delay_ms(retry_after_ms));
+        }
+        Duration::from_millis(retry.backoff_ms(attempt, jitter_fraction()))
     }
 
     async fn forward_upstream_response(
@@ -556,4 +656,35 @@ fn body_for_provider(
         requested_model,
         upstream_model: Some(upstream_model.clone()),
     }))
+}
+
+/// Parses a `Retry-After` header into milliseconds. Handles both the
+/// delta-seconds form (`Retry-After: 120`) and the HTTP-date form
+/// (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`). A malformed or past value
+/// yields `None`, so the caller falls back to computed backoff.
+fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+
+    let target = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = target.with_timezone(&Utc) - Utc::now();
+    delta
+        .num_milliseconds()
+        .try_into()
+        .ok()
+        .filter(|&ms: &u64| ms > 0)
+}
+
+/// A uniform random fraction in `[0, 1)` for full-jitter backoff, drawn from
+/// UUID v4 random bytes to avoid a dedicated RNG dependency.
+fn jitter_fraction() -> f64 {
+    let bytes = Uuid::new_v4().into_bytes();
+    let raw = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    // Map the 53 significant mantissa bits into [0, 1).
+    (raw >> 11) as f64 / (1u64 << 53) as f64
 }

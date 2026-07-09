@@ -33,6 +33,35 @@ pub struct GatewayConfig {
     pub usage_database: Option<UsageDatabaseConfig>,
     #[serde(default)]
     pub pricing: Vec<PricingConfig>,
+    #[serde(default)]
+    pub retry: RetryConfig,
+}
+
+/// Same-provider retry policy for rate-limit responses (default 429/529). An
+/// absent `[retry]` section yields these defaults. Hot-reloadable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct RetryConfig {
+    /// Upstream statuses that trigger a backed-off retry against the same
+    /// provider before advancing the failover chain.
+    pub retryable_statuses: Vec<u16>,
+    /// Total attempts per provider, including the initial try. Must be >= 1.
+    pub max_attempts: u32,
+    /// First backoff delay; subsequent delays grow toward `max_delay_ms`.
+    pub base_delay_ms: u64,
+    /// Upper bound on any single backoff wait, also capping a large `Retry-After`.
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            retryable_statuses: vec![429, 529],
+            max_attempts: 4,
+            base_delay_ms: 1000,
+            max_delay_ms: 8000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,8 +1,12 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
 };
 use tracing::warn;
 use uuid::Uuid;
@@ -17,6 +21,14 @@ use crate::config::UsageDatabaseConfig;
 
 pub(crate) type UsageRecordFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
+/// Bounded backlog of usage records awaiting a batched insert. A full channel
+/// drops the record rather than blocking the proxy response path.
+const USAGE_CHANNEL_CAPACITY: usize = 1024;
+/// Flush the buffer once this many records accumulate.
+const USAGE_BATCH_SIZE: usize = 128;
+/// Flush a non-empty buffer at least this often, even below the batch size.
+const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
 pub(crate) trait UsageRecorder: Send + Sync {
     fn record(&self, record: UsageRecord) -> UsageRecordFuture;
 
@@ -24,6 +36,13 @@ pub(crate) trait UsageRecorder: Send + Sync {
     /// readable store (usage recording disabled).
     fn query(&self) -> Option<&dyn UsageQuery> {
         None
+    }
+
+    /// Flushes any buffered records and stops background work before exit.
+    /// The default is a no-op for recorders that write synchronously or not
+    /// at all; the batched SeaORM recorder overrides it to drain its queue.
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
     }
 }
 
@@ -76,8 +95,23 @@ impl UsageRecorder for MemoryUsageRecorder {
     }
 }
 
+/// Persists usage records through a background batch writer. `record()` only
+/// enqueues onto a bounded channel and returns immediately, so the proxy
+/// response path never awaits a database round-trip. Reads go straight to the
+/// database connection, which is shared with the writer task.
 pub(crate) struct SeaOrmUsageRecorder {
     db: DatabaseConnection,
+    sender: mpsc::Sender<UsageRecord>,
+    /// Held so the recorder can flush and join the writer on shutdown; taken
+    /// once by `shutdown`.
+    writer: std::sync::Mutex<Option<WriterHandle>>,
+}
+
+/// The background writer task plus the shutdown signal that tells it to drain
+/// and flush before exiting.
+struct WriterHandle {
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
 }
 
 impl SeaOrmUsageRecorder {
@@ -90,8 +124,24 @@ impl SeaOrmUsageRecorder {
         let db = Database::connect(options)
             .await
             .context("failed to connect usage database")?;
-        Ok(Self { db })
+
+        let (sender, receiver) = mpsc::channel(USAGE_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let sink = DbSink { db: db.clone() };
+        let task = tokio::spawn(async move {
+            run_writer(sink, receiver, shutdown_rx).await;
+        });
+
+        Ok(Self {
+            db,
+            sender,
+            writer: std::sync::Mutex::new(Some(WriterHandle {
+                shutdown: shutdown_tx,
+                task,
+            })),
+        })
     }
+
 }
 
 impl UsageRecorder for SeaOrmUsageRecorder {
@@ -99,38 +149,137 @@ impl UsageRecorder for SeaOrmUsageRecorder {
         Some(self)
     }
 
-    fn record(&self, record: UsageRecord) -> UsageRecordFuture {
-        let db = self.db.clone();
+    /// Signals the writer task to drain the channel, flush the final batch, and
+    /// exit, then awaits its completion. Idempotent: later calls are no-ops.
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let active = usage_record::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                request_id: Set(record.request_id),
-                created_at: Set(record.created_at),
-                provider_id: Set(record.provider_id),
-                protocol: Set(record.protocol.to_string()),
-                path: Set(record.path),
-                requested_model: Set(record.requested_model),
-                upstream_model: Set(record.upstream_model),
-                status: Set(record.status as i32),
-                latency_ms: Set(record.latency_ms),
-                input_tokens: Set(record.input_tokens),
-                output_tokens: Set(record.output_tokens),
-                cached_input_tokens: Set(record.cached_input_tokens),
-                cache_read_tokens: Set(record.cache_read_tokens),
-                cache_write_tokens: Set(record.cache_write_tokens),
-                total_tokens: Set(record.total_tokens),
-                estimated_cost: Set(record.estimated_cost),
-                currency: Set(record.currency),
-                usage_source: Set(record.usage_source.to_string()),
-                pricing_source: Set(record.pricing_source),
-            };
-            usage_record::Entity::insert(active)
-                .exec_without_returning(&db)
-                .await
-                .context("failed to insert usage record")?;
-            Ok(())
+            let handle = self.writer.lock().unwrap().take();
+            if let Some(handle) = handle {
+                // Dropping our sender lets the writer see the channel close
+                // after it drains; the oneshot tells it to stop waiting for
+                // new records.
+                let _ = handle.shutdown.send(());
+                if let Err(error) = handle.task.await {
+                    warn!(%error, "usage writer task did not shut down cleanly");
+                }
+            }
         })
     }
+
+    fn record(&self, record: UsageRecord) -> UsageRecordFuture {
+        // Non-blocking enqueue: a full channel drops the record with a warning
+        // rather than stalling the proxy. Usage is best-effort by design.
+        match self.sender.try_send(record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("usage write buffer full; dropping usage record");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("usage writer channel closed; dropping usage record");
+            }
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn active_from_record(record: UsageRecord) -> usage_record::ActiveModel {
+    usage_record::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        request_id: Set(record.request_id),
+        created_at: Set(record.created_at),
+        provider_id: Set(record.provider_id),
+        protocol: Set(record.protocol.to_string()),
+        path: Set(record.path),
+        requested_model: Set(record.requested_model),
+        upstream_model: Set(record.upstream_model),
+        status: Set(record.status as i32),
+        latency_ms: Set(record.latency_ms),
+        input_tokens: Set(record.input_tokens),
+        output_tokens: Set(record.output_tokens),
+        cached_input_tokens: Set(record.cached_input_tokens),
+        cache_read_tokens: Set(record.cache_read_tokens),
+        cache_write_tokens: Set(record.cache_write_tokens),
+        total_tokens: Set(record.total_tokens),
+        estimated_cost: Set(record.estimated_cost),
+        currency: Set(record.currency),
+        usage_source: Set(record.usage_source.to_string()),
+        pricing_source: Set(record.pricing_source),
+    }
+}
+
+/// Receives batches of records to persist. The production sink writes to
+/// Postgres; tests use an in-memory sink to observe the writer's batching and
+/// flush behavior without a database.
+trait BatchSink: Send + Sync + 'static {
+    fn flush(&self, batch: Vec<UsageRecord>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// Inserts a batch in one statement; on failure logs and drops the batch so a
+/// transient database problem never wedges the writer or grows memory.
+struct DbSink {
+    db: DatabaseConnection,
+}
+
+impl BatchSink for DbSink {
+    fn flush(&self, batch: Vec<UsageRecord>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if batch.is_empty() {
+                return;
+            }
+            let count = batch.len();
+            let models = batch.into_iter().map(active_from_record);
+            if let Err(error) = usage_record::Entity::insert_many(models)
+                .exec_without_returning(&self.db)
+                .await
+            {
+                warn!(%error, count, "failed to insert usage record batch; dropping it");
+            }
+        })
+    }
+}
+
+/// Drains the channel, flushing to the sink on batch size or interval. On
+/// shutdown it drains whatever remains and flushes a final batch before
+/// returning.
+async fn run_writer<S: BatchSink>(
+    sink: S,
+    mut receiver: mpsc::Receiver<UsageRecord>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut buffer: Vec<UsageRecord> = Vec::with_capacity(USAGE_BATCH_SIZE);
+    let mut ticker = tokio::time::interval(USAGE_FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            maybe_record = receiver.recv() => {
+                match maybe_record {
+                    Some(record) => {
+                        buffer.push(record);
+                        if buffer.len() >= USAGE_BATCH_SIZE {
+                            sink.flush(std::mem::take(&mut buffer)).await;
+                        }
+                    }
+                    // All senders dropped: drain nothing more, flush and exit.
+                    None => break,
+                }
+            }
+            _ = ticker.tick() => {
+                if !buffer.is_empty() {
+                    sink.flush(std::mem::take(&mut buffer)).await;
+                }
+            }
+            _ = &mut shutdown => {
+                // Drain any records already queued, then stop.
+                while let Ok(record) = receiver.try_recv() {
+                    buffer.push(record);
+                }
+                break;
+            }
+        }
+    }
+
+    sink.flush(std::mem::take(&mut buffer)).await;
 }
 
 pub(crate) async fn recorder_from_config(
@@ -655,5 +804,126 @@ impl UsageQuery for MemoryUsageRecorder {
                 .collect(),
         };
         Box::pin(async move { Ok(summary) })
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use std::sync::{Arc, Mutex};
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::model::Protocol;
+    use crate::usage::UsageSource;
+
+    /// In-memory sink recording every flushed batch so tests can observe the
+    /// writer's batching and shutdown behavior without a database.
+    #[derive(Clone, Default)]
+    struct MemorySink {
+        batches: Arc<Mutex<Vec<Vec<UsageRecord>>>>,
+    }
+
+    impl MemorySink {
+        fn batches(&self) -> Vec<Vec<UsageRecord>> {
+            self.batches.lock().unwrap().clone()
+        }
+
+        fn total_records(&self) -> usize {
+            self.batches.lock().unwrap().iter().map(Vec::len).sum()
+        }
+    }
+
+    impl BatchSink for MemorySink {
+        fn flush(&self, batch: Vec<UsageRecord>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            let batches = self.batches.clone();
+            Box::pin(async move {
+                if batch.is_empty() {
+                    return;
+                }
+                batches.lock().unwrap().push(batch);
+            })
+        }
+    }
+
+    fn record(request_id: &str) -> UsageRecord {
+        UsageRecord {
+            request_id: request_id.to_owned(),
+            created_at: Utc::now(),
+            provider_id: "p".to_owned(),
+            protocol: Protocol::OpenAi,
+            path: "/v1/chat/completions".to_owned(),
+            requested_model: None,
+            upstream_model: None,
+            status: 200,
+            latency_ms: 1,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+            estimated_cost: None,
+            currency: None,
+            usage_source: UsageSource::ProviderResponse,
+            pricing_source: None,
+        }
+    }
+
+    /// Task 7.8 / 7.10: records enqueued before shutdown are flushed when the
+    /// writer is told to drain, even when far below the batch size.
+    #[tokio::test]
+    async fn shutdown_flushes_pending_records() {
+        let sink = MemorySink::default();
+        let (sender, receiver) = mpsc::channel(USAGE_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_writer(sink.clone(), receiver, shutdown_rx));
+
+        for i in 0..3 {
+            sender.try_send(record(&format!("r{i}"))).unwrap();
+        }
+
+        // Signal drain-and-exit, then join the writer.
+        shutdown_tx.send(()).unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(sink.total_records(), 3);
+    }
+
+    /// A full run of `USAGE_BATCH_SIZE` records flushes as a single batch by
+    /// size before any interval tick.
+    #[tokio::test]
+    async fn full_batch_flushes_by_size() {
+        let sink = MemorySink::default();
+        let (sender, receiver) = mpsc::channel(USAGE_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_writer(sink.clone(), receiver, shutdown_rx));
+
+        for i in 0..USAGE_BATCH_SIZE {
+            sender.try_send(record(&format!("r{i}"))).unwrap();
+        }
+
+        shutdown_tx.send(()).unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches[0].len(), USAGE_BATCH_SIZE);
+        assert_eq!(sink.total_records(), USAGE_BATCH_SIZE);
+    }
+
+    /// Task 7.9: once the bounded channel is full, further `try_send` calls
+    /// fail fast (the recorder drops with a warning) rather than blocking.
+    #[test]
+    fn full_channel_rejects_without_blocking() {
+        let (sender, _receiver) = mpsc::channel::<UsageRecord>(2);
+        assert!(sender.try_send(record("a")).is_ok());
+        assert!(sender.try_send(record("b")).is_ok());
+        // Third send has no capacity and no consumer; must not block.
+        match sender.try_send(record("c")) {
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            other => panic!("expected Full, got {other:?}"),
+        }
     }
 }

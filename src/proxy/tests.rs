@@ -21,7 +21,7 @@ use super::{
     upstream::{UpstreamClient, UpstreamFuture, UpstreamRequest, UpstreamResponse},
 };
 use crate::{
-    config::{GatewayConfig, PricingConfig, ProviderConfig, RouteConfig},
+    config::{GatewayConfig, PricingConfig, ProviderConfig, RetryConfig, RouteConfig},
     model::{Protocol, default_listen_addr},
     reload::{self, SharedGatewayState},
     state::GatewayState,
@@ -195,6 +195,17 @@ fn failover_config() -> GatewayConfig {
         }],
         usage_database: None,
         pricing: Vec::new(),
+        retry: fast_retry(),
+    }
+}
+
+/// Retry policy for tests: keeps the default attempt count and statuses but
+/// uses zero delays so retry paths never sleep in unit tests.
+fn fast_retry() -> RetryConfig {
+    RetryConfig {
+        base_delay_ms: 0,
+        max_delay_ms: 0,
+        ..RetryConfig::default()
     }
 }
 
@@ -250,6 +261,7 @@ fn config() -> GatewayConfig {
         ],
         usage_database: None,
         pricing: Vec::new(),
+        retry: fast_retry(),
     }
 }
 
@@ -1042,16 +1054,171 @@ async fn client_error_is_forwarded_without_failover() {
 }
 
 #[tokio::test]
-async fn rate_limit_is_forwarded_without_failover() {
+async fn rate_limit_retries_same_provider_then_succeeds() {
+    // Primary returns 429 twice, then 200; retries stay on the primary and the
+    // fallback is never contacted.
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 3);
+    // Every attempt targeted the primary.
+    assert!(
+        client
+            .uris()
+            .iter()
+            .all(|uri| uri.starts_with("http://primary.test"))
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_exhausts_attempts_then_fails_over() {
+    // Primary 429 for all 4 attempts, then fallback answers 200. Default
+    // max_attempts is 4, so the primary is tried 4 times before advancing.
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 5);
+    let uris = client.uris();
+    assert_eq!(uris.iter().filter(|u| u.starts_with("http://primary.test")).count(), 4);
+    assert_eq!(uris.iter().filter(|u| u.starts_with("http://fallback.test")).count(), 1);
+}
+
+#[tokio::test]
+async fn rate_limit_single_provider_forwards_last_response() {
+    // A single-provider chain that only ever returns 429 forwards the real 429
+    // to the client after exhausting attempts, not a synthesized 502.
+    let mut config = failover_config();
+    config.routes[0].providers = vec!["primary".to_owned()];
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+        Outcome::Status(StatusCode::TOO_MANY_REQUESTS),
+    ]));
+    let state = GatewayState::from_config_with_upstream(config, client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(client.calls(), 4);
+}
+
+#[tokio::test]
+async fn overloaded_529_is_retryable_like_429() {
+    // 529 is in the default retryable set; primary 529 then 200 succeeds on the
+    // primary without failover.
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::from_u16(529).unwrap()),
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 2);
+    assert!(
+        client
+            .uris()
+            .iter()
+            .all(|uri| uri.starts_with("http://primary.test"))
+    );
+}
+
+#[tokio::test]
+async fn server_error_fails_over_without_same_provider_retry() {
+    // 5xx still fails over immediately: primary is tried exactly once, then the
+    // fallback answers. No same-provider retry for 5xx.
+    let client = Arc::new(ScriptedClient::new([
+        Outcome::Status(StatusCode::INTERNAL_SERVER_ERROR),
+        Outcome::Status(StatusCode::OK),
+    ]));
+    let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
+
+    let response = send_chat(build_router_with_state(state)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(client.calls(), 2);
+    let uris = client.uris();
+    assert_eq!(uris.iter().filter(|u| u.starts_with("http://primary.test")).count(), 1);
+    assert_eq!(uris.iter().filter(|u| u.starts_with("http://fallback.test")).count(), 1);
+}
+
+#[tokio::test]
+async fn non_retryable_client_error_is_forwarded_immediately() {
+    // A 4xx that is not in the retryable set is forwarded on the first try with
+    // no retry and no failover.
     let client = Arc::new(ScriptedClient::new([Outcome::Status(
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_REQUEST,
     )]));
     let state = GatewayState::from_config_with_upstream(failover_config(), client.clone()).unwrap();
 
     let response = send_chat(build_router_with_state(state)).await;
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(client.calls(), 1);
+}
+
+#[test]
+fn retry_config_defaults_apply_when_absent() {
+    // The default RetryConfig is valid and yields the documented defaults.
+    let config = failover_config();
+    // Sanity: fast_retry keeps the default attempts/statuses.
+    assert_eq!(config.retry.max_attempts, 4);
+    assert!(config.retry.retryable_statuses.contains(&429));
+    assert!(config.retry.retryable_statuses.contains(&529));
+    assert!(GatewayState::from_config(config).is_ok());
+}
+
+#[test]
+fn retry_config_rejects_zero_attempts() {
+    let mut config = failover_config();
+    config.retry.max_attempts = 0;
+    assert!(GatewayState::from_config(config).is_err());
+}
+
+#[test]
+fn retry_config_rejects_base_delay_above_max() {
+    let mut config = failover_config();
+    config.retry.base_delay_ms = 5000;
+    config.retry.max_delay_ms = 1000;
+    assert!(GatewayState::from_config(config).is_err());
+}
+
+#[test]
+fn retry_backoff_is_capped_and_retry_after_bounded() {
+    // The computed backoff never exceeds max_delay, and a large Retry-After is
+    // capped to max_delay by the policy.
+    let policy = crate::model::RetryPolicy {
+        retryable_statuses: [429u16, 529].into_iter().collect(),
+        max_attempts: 4,
+        base_delay_ms: 1000,
+        max_delay_ms: 8000,
+    };
+    // Full-jitter draw with fraction 1.0 hits the ceiling; even a high attempt
+    // index stays capped at max_delay.
+    assert!(policy.backoff_ms(0, 1.0) <= 8000);
+    assert!(policy.backoff_ms(10, 1.0) <= 8000);
+    // Jitter of 0 yields no wait.
+    assert_eq!(policy.backoff_ms(3, 0.0), 0);
+    // A 300s Retry-After is capped to max_delay.
+    assert_eq!(policy.cap_delay_ms(300_000), 8000);
 }
 
 #[tokio::test]

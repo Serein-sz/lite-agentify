@@ -1,0 +1,33 @@
+# Gateway-only compose. Postgres already runs on this host (container `postgres`,
+# image postgres:18) and is attached to the external `cpa-net` network; the
+# gateway joins that same network so it can reach the DB by hostname `postgres`.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lite-agentify:latest
+    container_name: lite-agentify
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Holds lite-agentify.toml. Must be writable by uid 10001 (the container's
+      # `gateway` user): the process hash-rewrites admin_password on first boot.
+      - /opt/docker_config/lite-agentify:/config
+    environment:
+      LITE_AGENTIFY_GATEWAY_CONFIG: /config/lite-agentify.toml
+    networks:
+      - cpa-net
+    # In lite-agentify.toml, reach the DB over cpa-net by the container's
+    # hostname `postgres` (NOT localhost). The postgres container's credentials
+    # are user=serein / db=serein_db, e.g.:
+    #   [usage_database]
+    #   enabled = true
+    #   url = "postgres://serein:<password>@postgres:5432/serein_db"
+
+networks:
+  # Pre-existing bridge network the postgres container is attached to.
+  cpa-net:
+    external: true
+    name: cpa-net

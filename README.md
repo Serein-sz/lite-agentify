@@ -46,15 +46,42 @@ The gateway reloads its config file at runtime without a restart. Two triggers s
 
 Behavior:
 
-- Hot-reloadable fields: `providers` (including `model_aliases`), `routes`, `pricing`, `gateway_keys`, `admin_password`.
+- Hot-reloadable fields: `providers` (including `model_aliases`), `routes`, `pricing`, `gateway_keys`, `admin_password`, `retry`.
 - Not hot-reloadable: `listen_addr` and `usage_database` — changes are ignored with a warning log and require a restart; the remaining fields still take effect.
 - If the new config fails to parse or validate, the previous config keeps serving and the error is logged; the swap is atomic, so requests never see a partially applied config.
 - In-flight requests finish with the config snapshot they started with.
 - Gateway key changes apply immediately. To rotate keys without downtime: add the new key → reload → switch clients to it → remove the old key → reload.
 
+## Rate-Limit Retry
+
+When an upstream provider returns a rate-limit status, the gateway waits and retries the **same** provider a few times before advancing the failover chain. This targets the most common recoverable upstream error: a transient 429/529 that a short backoff usually clears, where switching providers immediately would waste the primary and hammer a fallback that may also be limited.
+
+The `[retry]` section is optional and hot-reloadable; an absent section uses the defaults shown:
+
+```toml
+[retry]
+# Upstream statuses that trigger a backed-off retry against the same provider.
+retryable_statuses = [429, 529]
+# Total attempts per provider, including the initial try (must be >= 1).
+max_attempts = 4
+# First backoff wait; subsequent waits grow toward max_delay_ms.
+base_delay_ms = 1000
+# Upper bound on any single wait, also capping a large Retry-After.
+max_delay_ms = 8000
+```
+
+Behavior:
+
+- On a retryable status the gateway waits, then retries the same provider, up to `max_attempts` total. Only when attempts are exhausted does it advance to the next provider in the chain.
+- The wait honors a `Retry-After` response header (seconds or HTTP-date form) when present, capped at `max_delay_ms`; otherwise it uses exponential backoff (`base_delay_ms` doubling toward `max_delay_ms`) with full jitter to avoid a thundering herd against a limited provider.
+- Transport errors and HTTP 5xx still fail over **immediately** with no same-provider retry (unchanged). Other 2xx/3xx/4xx responses are forwarded to the client as-is.
+- If the chain's last provider is still rate-limited after its retries, the gateway forwards that real rate-limit response (including any `Retry-After`) to the client rather than a synthetic 502.
+
 ## Usage Recording
 
 Token usage and cost persistence is optional. If `usage_database` is absent or disabled, the gateway continues proxying requests without writing usage records. Pricing is deployment-managed configuration; the gateway does not fetch provider prices or hard-code model rates.
+
+Usage records are written asynchronously: the proxy hands each record to a background writer that batches inserts, so the response path never waits on the database. This means the dashboard is eventually consistent — a just-completed request may not appear for up to the flush interval (~1s). On graceful shutdown (Ctrl-C / SIGTERM) the gateway drains and flushes the pending batch before exiting; a hard kill (SIGKILL) can still drop the in-memory buffer, which is acceptable because usage recording is best-effort and never blocks or fails a client response.
 
 Example TOML:
 
@@ -133,4 +160,14 @@ CREATE TABLE IF NOT EXISTS usage_records (
     usage_source text NOT NULL,
     pricing_source text NULL
 );
+
+-- Indexes for the dashboard's time-range, provider, and model queries.
+CREATE INDEX IF NOT EXISTS idx_usage_records_created_at
+    ON usage_records (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_records_provider_created_at
+    ON usage_records (provider_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_records_upstream_model
+    ON usage_records (upstream_model);
 ```
+
+Usage records are written asynchronously by a background batch writer: the proxy response path never waits on the database. Records land within the flush interval (batched by count or ~1s), so the admin dashboard can lag the most recent request by up to that window. On graceful shutdown (Ctrl-C / SIGTERM) the gateway drains and flushes the pending batch before exiting; a hard kill (SIGKILL) can still drop the last unflushed records, which is acceptable because usage recording is best-effort and never blocks or fails a client response.

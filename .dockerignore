@@ -1,0 +1,15 @@
+# Build artifacts — rebuilt inside the image.
+/target
+/ui/node_modules
+/ui/dist
+
+# Local tooling / VCS.
+/.git
+/.claude
+/.codex
+/.factory
+/.agents
+
+# Docs and specs don't affect the build.
+/openspec
+README.md

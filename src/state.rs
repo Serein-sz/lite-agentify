@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::{
     config::GatewayConfig,
-    model::{Provider, Route, trim_trailing_slash},
+    model::{Provider, RetryPolicy, Route, trim_trailing_slash},
     pricing::{PricingMap, pricing_map},
     proxy::upstream::{HyperUpstreamClient, UpstreamClient},
     usage::{NoopUsageRecorder, UsageRecorder},
@@ -27,6 +27,7 @@ pub(crate) struct GatewayState {
     pub(crate) upstream: Arc<dyn UpstreamClient>,
     pub(crate) usage_recorder: Arc<dyn UsageRecorder>,
     pub(crate) pricing: PricingMap,
+    pub(crate) retry_policy: RetryPolicy,
 }
 
 impl GatewayState {
@@ -181,6 +182,31 @@ impl GatewayState {
             bail!("at least one route is required");
         }
 
+        let retry = config.retry;
+        if retry.max_attempts < 1 {
+            bail!("retry.max_attempts must be at least 1");
+        }
+        if retry.base_delay_ms > retry.max_delay_ms {
+            bail!(
+                "retry.base_delay_ms ({}) must not exceed retry.max_delay_ms ({})",
+                retry.base_delay_ms,
+                retry.max_delay_ms
+            );
+        }
+        if let Some(status) = retry
+            .retryable_statuses
+            .iter()
+            .find(|status| !(100..=599).contains(*status))
+        {
+            bail!("retry.retryable_statuses contains out-of-range HTTP status {status}");
+        }
+        let retry_policy = RetryPolicy {
+            retryable_statuses: retry.retryable_statuses.into_iter().collect(),
+            max_attempts: retry.max_attempts,
+            base_delay_ms: retry.base_delay_ms,
+            max_delay_ms: retry.max_delay_ms,
+        };
+
         Ok(Self {
             gateway_keys: Arc::new(gateway_keys),
             admin_password: config.admin_password.map(Arc::new),
@@ -189,6 +215,7 @@ impl GatewayState {
             upstream,
             usage_recorder,
             pricing,
+            retry_policy,
         })
     }
 
