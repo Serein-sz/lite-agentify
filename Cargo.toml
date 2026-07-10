@@ -32,6 +32,9 @@ rust_decimal = { version = "1.39.0", features = ["serde"] }
 sea-orm = { version = "1.1.17", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-chrono", "with-rust_decimal", "with-uuid"] }
 arc-swap = "1.9.2"
 notify = "8.2.0"
+# Optional hot-state backend (spend counters, sessions, login lockout);
+# connected only when the config has a [redis] section.
+redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "connection-manager"] }
 
 # argon2 is deliberately slow; keep it optimized even in dev/test builds.
 [profile.dev.package.argon2]

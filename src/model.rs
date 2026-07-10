@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::net::SocketAddr;
 
 use serde::Deserialize;
 
@@ -26,14 +26,33 @@ pub(crate) struct Provider {
     pub base_url: String,
     pub api_key: String,
     pub anthropic_version: Option<String>,
-    pub model_aliases: HashMap<String, String>,
 }
 
+/// A resolved catalog entry: an enabled/disabled model with its ordered
+/// deployment chain. Deployments are stored in priority order.
 #[derive(Clone)]
-pub(crate) struct Route {
-    pub path_prefix: String,
-    pub provider_ids: Vec<String>,
-    pub model_prefix: Option<String>,
+pub(crate) struct ModelEntry {
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub deployments: Vec<Deployment>,
+}
+
+/// One hop in a model's failover chain: which provider serves it and the
+/// upstream model name the request body is rewritten to for that provider.
+#[derive(Clone)]
+pub(crate) struct Deployment {
+    pub provider_id: String,
+    pub upstream_model: String,
+}
+
+/// The endpoint protocol implied by a request path. Paths are fixed per
+/// protocol; only these map to a catalog resolution.
+pub(crate) fn protocol_of(path: &str) -> Option<Protocol> {
+    match path {
+        "/v1/chat/completions" | "/v1/responses" => Some(Protocol::OpenAi),
+        "/v1/messages" => Some(Protocol::Anthropic),
+        _ => None,
+    }
 }
 
 /// Resolved, validated retry policy carried in the hot-reloadable state

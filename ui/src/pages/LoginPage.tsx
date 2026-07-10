@@ -16,17 +16,18 @@ import { Input } from "@/components/ui/input";
 
 export default function LoginPage() {
   const navigate = useNavigate();
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const login = useMutation({
-    mutationFn: () => api.login(password),
+    mutationFn: () => api.login(username, password),
     onSuccess: () => navigate("/"),
     onError: (cause) => {
       if (cause instanceof ApiError && cause.status === 429) {
         setError("失败次数过多,已临时锁定,请稍后再试");
       } else if (cause instanceof ApiError && cause.status === 401) {
-        setError("密码错误");
+        setError("用户名或密码错误");
       } else {
         setError(cause instanceof Error ? cause.message : "登录失败");
       }
@@ -45,7 +46,7 @@ export default function LoginPage() {
         <ShineBorder shineColor="var(--foreground)" duration={12} />
         <CardHeader>
           <CardTitle className="text-base">lite-agentify 管理台</CardTitle>
-          <CardDescription>输入配置文件中设置的管理密码</CardDescription>
+          <CardDescription>使用账号和密码登录</CardDescription>
         </CardHeader>
         <CardContent>
           <form
@@ -57,17 +58,27 @@ export default function LoginPage() {
             }}
           >
             <Input
-              type="password"
+              type="text"
               autoFocus
+              autoComplete="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder="用户名"
+            />
+            <Input
+              type="password"
+              autoComplete="current-password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              placeholder="管理密码"
+              placeholder="密码"
             />
             {error && <p className="text-xs text-destructive">{error}</p>}
             <Button
               type="submit"
               className="w-full"
-              disabled={login.isPending || password.length === 0}
+              disabled={
+                login.isPending || username.length === 0 || password.length === 0
+              }
             >
               {login.isPending ? "登录中…" : "登录"}
             </Button>

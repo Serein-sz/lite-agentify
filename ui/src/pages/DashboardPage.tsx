@@ -47,6 +47,30 @@ import {
   formatTokens,
 } from "@/lib/format";
 
+/** 本人额度三卡:余额 / 累计充值 / 累计消费(所有角色可见)。 */
+function BalanceStrip() {
+  const balanceQuery = useQuery({ queryKey: ["my-balance"], queryFn: api.myBalance });
+  const data = balanceQuery.data;
+  if (!data) {
+    return null;
+  }
+  const usd = (value: number) =>
+    `${value.toLocaleString("zh-CN", { maximumFractionDigits: 4 })} USD`;
+  const balance = Number(data.balance);
+  return (
+    <BlurFade className="grid grid-cols-3 gap-3">
+      <StatCard
+        title="额度余额"
+        value={balance}
+        format={usd}
+        sub={balance < 0 ? "余额为负:在途请求超出了余额(软限)" : undefined}
+      />
+      <StatCard title="累计充值" value={Number(data.granted)} format={usd} />
+      <StatCard title="累计消费" value={Number(data.spent)} format={usd} />
+    </BlurFade>
+  );
+}
+
 const RANGES = [
   { key: "24h", label: "近 24 小时", hours: 24, bucket: "hour" as const },
   { key: "7d", label: "近 7 天", hours: 24 * 7, bucket: "day" as const },
@@ -158,7 +182,13 @@ const logColumns = [
   }),
 ];
 
-export default function DashboardPage() {
+import type { Role } from "@/api";
+
+export default function DashboardPage({ role }: { role: Role }) {
+  // Usage is scoped server-side by role: `user` sessions only ever receive
+  // their own rows, so no client-side filtering is needed. `role` is accepted
+  // for parity and future admin-only controls.
+  void role;
   const [rangeKey, setRangeKey] = useState("7d");
   const range = RANGES.find((entry) => entry.key === rangeKey) ?? RANGES[1];
 
@@ -166,6 +196,14 @@ export default function DashboardPage() {
   const [providerInput, setProviderInput] = useState("");
   const [providerFilter, setProviderFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [modelFilter, setModelFilter] = useState("all");
+
+  // The model filter offers the catalog's enabled model names.
+  const modelNamesQuery = useQuery({
+    queryKey: ["model-names"],
+    queryFn: api.listModelNames,
+  });
+  const modelNames = modelNamesQuery.data?.models ?? [];
 
   // from 只随范围切换变化,避免每次渲染生成新时间导致无限重取。
   const from = useMemo(
@@ -182,7 +220,7 @@ export default function DashboardPage() {
   });
 
   const listQuery = useQuery({
-    queryKey: ["usage-list", from, page, providerFilter, statusFilter],
+    queryKey: ["usage-list", from, page, providerFilter, statusFilter, modelFilter],
     placeholderData: keepPreviousData,
     queryFn: () => {
       const params = new URLSearchParams({
@@ -192,6 +230,7 @@ export default function DashboardPage() {
       });
       if (providerFilter) params.set("provider", providerFilter);
       if (statusFilter !== "all") params.set("status", statusFilter);
+      if (modelFilter !== "all") params.set("model", modelFilter);
       return api.usageList(params);
     },
   });
@@ -280,15 +319,18 @@ export default function DashboardPage() {
 
   if (summary && !summary.usage_enabled) {
     return (
-      <Card>
-        <CardContent className="py-16 text-center">
-          <p className="text-base font-medium">未启用用量记录</p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            在配置文件的 [usage_database] 中配置 PostgreSQL 并重启网关后,
-            这里会展示请求、token 与成本统计。
-          </p>
-        </CardContent>
-      </Card>
+      <div className="space-y-6">
+        <BalanceStrip />
+        <Card>
+          <CardContent className="py-16 text-center">
+            <p className="text-base font-medium">未启用用量记录</p>
+            <p className="mt-2 text-xs text-muted-foreground">
+              在配置文件的 [usage_database] 中配置 PostgreSQL 并重启网关后,
+              这里会展示请求、token 与成本统计。
+            </p>
+          </CardContent>
+        </Card>
+      </div>
     );
   }
 
@@ -319,6 +361,8 @@ export default function DashboardPage() {
           ))}
         </div>
       </div>
+
+      <BalanceStrip />
 
       <BlurFade className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard
@@ -426,6 +470,27 @@ export default function DashboardPage() {
           <CardContent className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
               <div className="ml-auto flex items-center gap-2">
+                <Select
+                  value={modelFilter}
+                  onValueChange={(value) => {
+                    setModelFilter(String(value));
+                    setPage(1);
+                  }}
+                >
+                  <SelectTrigger className="w-44">
+                    <SelectValue>
+                      {modelFilter === "all" ? "全部模型" : modelFilter}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部模型</SelectItem>
+                    {modelNames.map((name) => (
+                      <SelectItem key={name} value={name}>
+                        {name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <Input
                   value={providerInput}
                   onChange={(event) => setProviderInput(event.target.value)}

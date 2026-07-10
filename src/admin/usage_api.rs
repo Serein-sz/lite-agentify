@@ -1,5 +1,5 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -7,8 +7,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
-use super::AdminState;
+use super::{AdminState, SessionIdentity};
+use crate::account::Role;
 use crate::usage::{
     StatusFilter, SummaryBucket, UsageListParams, UsageRow, UsageSummary, UsageSummaryParams,
 };
@@ -23,6 +25,9 @@ pub(crate) struct ListQuery {
     provider: Option<String>,
     model: Option<String>,
     status: Option<String>,
+    /// Admin-only filters; ignored (scope-forced) for user-role sessions.
+    user: Option<Uuid>,
+    api_key: Option<Uuid>,
     page: Option<u64>,
     page_size: Option<u64>,
 }
@@ -38,6 +43,7 @@ struct ListResponse {
 
 pub(crate) async fn list_usage(
     State(state): State<AdminState>,
+    Extension(identity): Extension<SessionIdentity>,
     Query(query): Query<ListQuery>,
 ) -> Response {
     let from = match parse_time(query.from.as_deref(), "from") {
@@ -53,12 +59,21 @@ pub(crate) async fn list_usage(
         Err(response) => return response,
     };
 
+    // User-role callers are hard-scoped to their own rows: the session user
+    // overrides any requested user filter. Admins may filter freely.
+    let user_id = match identity.role {
+        Role::Admin => query.user,
+        Role::User => Some(identity.user_id),
+    };
+
     let params = UsageListParams {
         from,
         to,
         provider: query.provider,
         model: query.model,
         status,
+        user_id,
+        api_key_id: query.api_key,
         page: query.page.unwrap_or(1).max(1),
         page_size: query
             .page_size
@@ -97,6 +112,8 @@ pub(crate) struct SummaryQuery {
     from: Option<String>,
     to: Option<String>,
     bucket: Option<String>,
+    /// Admin-only filter; ignored (scope-forced) for user-role sessions.
+    user: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -108,6 +125,7 @@ struct SummaryResponse {
 
 pub(crate) async fn usage_summary(
     State(state): State<AdminState>,
+    Extension(identity): Extension<SessionIdentity>,
     Query(query): Query<SummaryQuery>,
 ) -> Response {
     let from = match parse_time(query.from.as_deref(), "from") {
@@ -125,6 +143,10 @@ pub(crate) async fn usage_summary(
             return bad_request(format!("invalid bucket '{other}': expected hour or day"));
         }
     };
+    let user_id = match identity.role {
+        Role::Admin => query.user,
+        Role::User => Some(identity.user_id),
+    };
 
     let recorder = state.shared().load().usage_recorder.clone();
     let Some(source) = recorder.query() else {
@@ -135,7 +157,15 @@ pub(crate) async fn usage_summary(
         .into_response();
     };
 
-    match source.summary(UsageSummaryParams { from, to, bucket }).await {
+    match source
+        .summary(UsageSummaryParams {
+            from,
+            to,
+            bucket,
+            user_id,
+        })
+        .await
+    {
         Ok(summary) => Json(SummaryResponse {
             usage_enabled: true,
             summary,

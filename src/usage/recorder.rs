@@ -1,9 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Set};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -17,7 +15,6 @@ use super::query::{
     UsageQueryFuture, UsageRow, UsageSeriesPoint, UsageSummary, UsageSummaryParams, UsageTotals,
 };
 use super::record::UsageRecord;
-use crate::config::UsageDatabaseConfig;
 
 pub(crate) type UsageRecordFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
@@ -115,16 +112,9 @@ struct WriterHandle {
 }
 
 impl SeaOrmUsageRecorder {
-    pub(crate) async fn connect(config: &UsageDatabaseConfig) -> anyhow::Result<Self> {
-        let mut options = ConnectOptions::new(config.url.clone());
-        if let Some(max_connections) = config.max_connections {
-            options.max_connections(max_connections);
-        }
-
-        let db = Database::connect(options)
-            .await
-            .context("failed to connect usage database")?;
-
+    /// Builds the batched recorder over an existing connection (the primary
+    /// database is shared with accounts and connected once at startup).
+    pub(crate) fn new(db: DatabaseConnection) -> Self {
         let (sender, receiver) = mpsc::channel(USAGE_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let sink = DbSink { db: db.clone() };
@@ -132,16 +122,15 @@ impl SeaOrmUsageRecorder {
             run_writer(sink, receiver, shutdown_rx).await;
         });
 
-        Ok(Self {
+        Self {
             db,
             sender,
             writer: std::sync::Mutex::new(Some(WriterHandle {
                 shutdown: shutdown_tx,
                 task,
             })),
-        })
+        }
     }
-
 }
 
 impl UsageRecorder for SeaOrmUsageRecorder {
@@ -190,6 +179,8 @@ fn active_from_record(record: UsageRecord) -> usage_record::ActiveModel {
         provider_id: Set(record.provider_id),
         protocol: Set(record.protocol.to_string()),
         path: Set(record.path),
+        user_id: Set(record.user_id),
+        api_key_id: Set(record.api_key_id),
         requested_model: Set(record.requested_model),
         upstream_model: Set(record.upstream_model),
         status: Set(record.status as i32),
@@ -227,12 +218,42 @@ impl BatchSink for DbSink {
                 return;
             }
             let count = batch.len();
+            // Piggyback last-used touches on the batch: distinct key ids and
+            // the newest timestamp seen for each, one UPDATE per flush.
+            let mut last_used: std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>> =
+                std::collections::HashMap::new();
+            for record in &batch {
+                if let Some(api_key_id) = record.api_key_id {
+                    let entry = last_used.entry(api_key_id).or_insert(record.created_at);
+                    if record.created_at > *entry {
+                        *entry = record.created_at;
+                    }
+                }
+            }
+
             let models = batch.into_iter().map(active_from_record);
             if let Err(error) = usage_record::Entity::insert_many(models)
                 .exec_without_returning(&self.db)
                 .await
             {
                 warn!(%error, count, "failed to insert usage record batch; dropping it");
+            }
+
+            if !last_used.is_empty() {
+                let ids: Vec<sea_orm::Value> =
+                    last_used.keys().copied().map(Into::into).collect();
+                let newest = last_used.values().copied().max();
+                let statement = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "UPDATE api_keys SET last_used_at = $1 WHERE id = ANY($2)",
+                    [newest.into(), sea_orm::Value::Array(
+                        sea_orm::sea_query::ArrayType::Uuid,
+                        Some(Box::new(ids)),
+                    )],
+                );
+                if let Err(error) = self.db.execute(statement).await {
+                    warn!(%error, "failed to update api key last_used_at");
+                }
             }
         })
     }
@@ -282,18 +303,8 @@ async fn run_writer<S: BatchSink>(
     sink.flush(std::mem::take(&mut buffer)).await;
 }
 
-pub(crate) async fn recorder_from_config(
-    config: Option<&UsageDatabaseConfig>,
-) -> anyhow::Result<Arc<dyn UsageRecorder>> {
-    let Some(config) = config else {
-        return Ok(Arc::new(NoopUsageRecorder));
-    };
-
-    if !config.enabled {
-        return Ok(Arc::new(NoopUsageRecorder));
-    }
-
-    Ok(Arc::new(SeaOrmUsageRecorder::connect(config).await?))
+pub(crate) fn recorder_from_db(db: DatabaseConnection) -> Arc<dyn UsageRecorder> {
+    Arc::new(SeaOrmUsageRecorder::new(db))
 }
 
 pub(crate) fn warn_record_error(error: anyhow::Error) {
@@ -307,12 +318,15 @@ struct SqlFilter {
 }
 
 impl SqlFilter {
+    #[allow(clippy::too_many_arguments)]
     fn from_params(
         from: Option<chrono::DateTime<chrono::Utc>>,
         to: Option<chrono::DateTime<chrono::Utc>>,
         provider: Option<String>,
         model: Option<String>,
         status: Option<super::query::StatusFilter>,
+        user_id: Option<Uuid>,
+        api_key_id: Option<Uuid>,
     ) -> Self {
         let mut filter = Self {
             clauses: Vec::new(),
@@ -326,6 +340,12 @@ impl SqlFilter {
         }
         if let Some(provider) = provider {
             filter.push_value("provider_id = ", provider);
+        }
+        if let Some(user_id) = user_id {
+            filter.push_value("user_id = ", user_id);
+        }
+        if let Some(api_key_id) = api_key_id {
+            filter.push_value("api_key_id = ", api_key_id);
         }
         if let Some(model) = model {
             let first = filter.next_placeholder();
@@ -398,6 +418,8 @@ impl UsageQuery for SeaOrmUsageRecorder {
                 params.provider,
                 params.model,
                 params.status,
+                params.user_id,
+                params.api_key_id,
             );
             let where_clause = filter.where_clause();
 
@@ -425,7 +447,8 @@ impl UsageQuery for SeaOrmUsageRecorder {
             let list_statement = sea_orm::Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
                 format!(
-                    "SELECT request_id, created_at, provider_id, protocol, path, requested_model, \
+                    "SELECT request_id, created_at, provider_id, protocol, path, user_id, \
+                     api_key_id, requested_model, \
                      upstream_model, status, latency_ms, input_tokens, output_tokens, \
                      cached_input_tokens, cache_read_tokens, cache_write_tokens, total_tokens, \
                      estimated_cost, currency, usage_source \
@@ -446,6 +469,8 @@ impl UsageQuery for SeaOrmUsageRecorder {
                         provider_id: row.try_get("", "provider_id")?,
                         protocol: row.try_get("", "protocol")?,
                         path: row.try_get("", "path")?,
+                        user_id: row.try_get("", "user_id")?,
+                        api_key_id: row.try_get("", "api_key_id")?,
                         requested_model: row.try_get("", "requested_model")?,
                         upstream_model: row.try_get("", "upstream_model")?,
                         status: row.try_get::<i32>("", "status")?.clamp(0, u16::MAX as i32) as u16,
@@ -471,8 +496,15 @@ impl UsageQuery for SeaOrmUsageRecorder {
     fn summary(&self, params: UsageSummaryParams) -> UsageQueryFuture<UsageSummary> {
         let db = self.db.clone();
         Box::pin(async move {
-            let filter =
-                SqlFilter::from_params(params.from, params.to, None, None, None);
+            let filter = SqlFilter::from_params(
+                params.from,
+                params.to,
+                None,
+                None,
+                None,
+                params.user_id,
+                None,
+            );
             let where_clause = filter.where_clause();
             let bucket = match params.bucket {
                 SummaryBucket::Hour => "hour",
@@ -645,6 +677,8 @@ impl MemoryUsageRecorder {
         provider: Option<&str>,
         model: Option<&str>,
         status: Option<super::query::StatusFilter>,
+        user_id: Option<Uuid>,
+        api_key_id: Option<Uuid>,
     ) -> Vec<UsageRecord> {
         self.records
             .lock()
@@ -654,6 +688,8 @@ impl MemoryUsageRecorder {
                 from.is_none_or(|from| record.created_at >= from)
                     && to.is_none_or(|to| record.created_at <= to)
                     && provider.is_none_or(|provider| record.provider_id == provider)
+                    && user_id.is_none_or(|user_id| record.user_id == Some(user_id))
+                    && api_key_id.is_none_or(|api_key_id| record.api_key_id == Some(api_key_id))
                     && model.is_none_or(|model| {
                         record.requested_model.as_deref() == Some(model)
                             || record.upstream_model.as_deref() == Some(model)
@@ -673,6 +709,8 @@ fn usage_row_from_record(record: &UsageRecord) -> UsageRow {
         provider_id: record.provider_id.clone(),
         protocol: record.protocol.to_string(),
         path: record.path.clone(),
+        user_id: record.user_id,
+        api_key_id: record.api_key_id,
         requested_model: record.requested_model.clone(),
         upstream_model: record.upstream_model.clone(),
         status: record.status,
@@ -717,6 +755,8 @@ impl UsageQuery for MemoryUsageRecorder {
             params.provider.as_deref(),
             params.model.as_deref(),
             params.status,
+            params.user_id,
+            params.api_key_id,
         );
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         let total = records.len() as u64;
@@ -730,7 +770,7 @@ impl UsageQuery for MemoryUsageRecorder {
     }
 
     fn summary(&self, params: UsageSummaryParams) -> UsageQueryFuture<UsageSummary> {
-        let records = self.filtered(params.from, params.to, None, None, None);
+        let records = self.filtered(params.from, params.to, None, None, None, params.user_id, None);
 
         let requests = records.len() as u64;
         let errors = records.iter().filter(|record| record.status >= 400).count() as u64;
@@ -853,6 +893,8 @@ mod writer_tests {
             provider_id: "p".to_owned(),
             protocol: Protocol::OpenAi,
             path: "/v1/chat/completions".to_owned(),
+            user_id: None,
+            api_key_id: None,
             requested_model: None,
             upstream_model: None,
             status: 200,

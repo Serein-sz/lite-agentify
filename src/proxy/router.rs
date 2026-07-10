@@ -27,12 +27,12 @@ use super::{
 use crate::{
     config::GatewayConfig,
     domain::TokenUsage,
-    model::{Protocol, Provider},
+    model::{Protocol, Provider, protocol_of},
     pricing::calculate_cost,
     reload::SharedGatewayState,
-    state::GatewayState,
+    state::{GatewayState, Resolution},
     usage::{
-        UsageObserver, UsageRecord, UsageSource, parse_non_streaming_usage, recorder_from_config,
+        UsageObserver, UsageRecord, UsageSource, parse_non_streaming_usage, recorder_from_db,
         warn_record_error,
     },
 };
@@ -41,31 +41,149 @@ pub async fn build_router(
     config: GatewayConfig,
     config_path: PathBuf,
 ) -> anyhow::Result<(Router, SharedGatewayState)> {
-    let recorder = recorder_from_config(config.usage_database.as_ref()).await?;
-    let state = GatewayState::from_config_with_upstream_and_recorder(
+    // The primary database is mandatory: accounts, API keys, usage records,
+    // providers, pricing, and the model catalog all live in PostgreSQL.
+    // Startup fails fast when it is unreachable.
+    let database_config = config.required_database()?;
+    let db = crate::db::connect(database_config).await?;
+    crate::db::migrate(&db).await?;
+    crate::account::bootstrap_accounts(&db, &config).await?;
+
+    let account_store = crate::account::SeaOrmAccountStore::new(db.clone());
+    let api_keys = crate::account::AccountStore::active_key_map(&account_store).await?;
+
+    // One-time file → database imports: providers and pricing (change 2), then
+    // routes + aliases → model catalog (change 3). Afterwards the database is
+    // the source of truth for all of them.
+    let catalog_store = crate::catalog::SeaOrmCatalogStore::new(db.clone());
+    crate::catalog::import_config_once(&catalog_store, &config).await?;
+    crate::catalog::migrate_routes_once(&catalog_store, &config).await?;
+    let catalog = crate::catalog::CatalogStore::snapshot(&catalog_store).await?;
+
+    let recorder = recorder_from_db(db.clone());
+
+    // Redis is the optional hot-state backend: spend counters, admin
+    // sessions, login lockout, and the reserved config_changed channel all
+    // move there when `[redis]` is configured; otherwise everything stays in
+    // process memory.
+    let redis = match &config.redis {
+        Some(redis_config) => {
+            let client = redis::Client::open(redis_config.url.as_str())
+                .context("invalid redis url in [redis] config")?;
+            let connection = redis::aio::ConnectionManager::new(client.clone())
+                .await
+                .context("failed to connect redis (the [redis] section is configured)")?;
+            info!("redis hot-state backend connected (spend counters, sessions, lockout)");
+            Some((client, connection))
+        }
+        None => None,
+    };
+
+    // Spend counters: seeded from Postgres truth before serving; a background
+    // loop re-reconciles every interval.
+    let quota_store = std::sync::Arc::new(crate::quota::SeaOrmQuotaStore::new(db.clone()));
+    let spend_counter: std::sync::Arc<dyn crate::quota::SpendCounter> = match &redis {
+        Some((_, connection)) => {
+            std::sync::Arc::new(crate::quota::RedisCounter::new(connection.clone()))
+        }
+        None => std::sync::Arc::new(crate::quota::MemoryCounter::default()),
+    };
+    crate::quota::reconcile_counters(quota_store.as_ref(), spend_counter.as_ref()).await?;
+    crate::quota::spawn_reconciliation(quota_store.clone(), spend_counter.clone());
+    let granted = crate::quota::QuotaStore::grant_sums(quota_store.as_ref()).await?;
+
+    // Admin sessions survive restarts in Redis mode; reads fail closed
+    // during an outage. The notifier/subscriber pair services the reserved
+    // config_changed channel (single-instance no-op).
+    let sessions: std::sync::Arc<dyn crate::admin::SessionStore> = match &redis {
+        Some((_, connection)) => {
+            std::sync::Arc::new(crate::admin::RedisSessionStore::new(connection.clone()))
+        }
+        None => std::sync::Arc::new(crate::admin::MemorySessionStore::default()),
+    };
+    let notifier = redis
+        .as_ref()
+        .map(|(_, connection)| crate::pubsub::ConfigNotifier::new(connection.clone()));
+    if let Some((client, _)) = &redis {
+        crate::pubsub::spawn_config_subscriber(client.clone());
+    }
+
+    let state = GatewayState::from_parts(
         config.clone(),
+        catalog.clone(),
         std::sync::Arc::new(super::upstream::HyperUpstreamClient::new()),
         recorder,
-    )?;
-    let shared = SharedGatewayState::new(state, &config, config_path);
-    Ok((build_router_with_shared(shared.clone()), shared))
+    )?
+    .with_api_keys(api_keys)
+    .with_granted(granted)
+    .with_spend_counter(spend_counter);
+    let shared = SharedGatewayState::new(state, &config, config_path, catalog);
+    Ok((
+        build_router_with_shared(
+            shared.clone(),
+            std::sync::Arc::new(account_store),
+            std::sync::Arc::new(catalog_store),
+            quota_store,
+            sessions,
+            notifier,
+        ),
+        shared,
+    ))
 }
 
 #[cfg(test)]
 pub(crate) fn build_router_with_state(state: GatewayState) -> Router {
-    build_router_with_shared(SharedGatewayState::without_reload(state))
+    build_router_with_shared(
+        SharedGatewayState::without_reload(state),
+        std::sync::Arc::new(crate::account::MemoryAccountStore::default()),
+        std::sync::Arc::new(crate::catalog::MemoryCatalogStore::default()),
+        std::sync::Arc::new(crate::quota::MemoryQuotaStore::default()),
+        std::sync::Arc::new(crate::admin::MemorySessionStore::default()),
+        None,
+    )
 }
 
-pub(crate) fn build_router_with_shared(shared: SharedGatewayState) -> Router {
-    // The admin console owns the /admin prefix (404 stub when disabled), so
-    // nothing under it can ever fall through to the upstream proxy.
-    let admin = crate::admin::admin_router(&shared);
+pub(crate) fn build_router_with_shared(
+    shared: SharedGatewayState,
+    account_store: std::sync::Arc<dyn crate::account::AccountStore>,
+    catalog_store: std::sync::Arc<dyn crate::catalog::CatalogStore>,
+    quota_store: std::sync::Arc<dyn crate::quota::QuotaStore>,
+    sessions: std::sync::Arc<dyn crate::admin::SessionStore>,
+    notifier: Option<crate::pubsub::ConfigNotifier>,
+) -> Router {
+    // The admin console owns the /admin prefix, so nothing under it can ever
+    // fall through to the upstream proxy.
+    let admin = crate::admin::admin_router(
+        &shared,
+        account_store,
+        catalog_store,
+        quota_store,
+        sessions,
+        notifier,
+    );
+    // Model endpoints are fixed per protocol; everything else 404s instead of
+    // being blindly proxied — the catalog is the routing contract.
     Router::new()
         .route("/healthz", get(healthz))
         .route("/reload", post(reload_endpoint))
+        .route("/v1/chat/completions", post(proxy))
+        .route("/v1/responses", post(proxy))
+        .route("/v1/messages", post(proxy))
+        .route("/v1/models", get(list_models))
         .nest_service("/admin", admin)
-        .fallback(any(proxy))
+        .fallback(any(unknown_endpoint))
         .with_state(shared)
+}
+
+async fn unknown_endpoint(request: Request) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "unknown endpoint {}; model endpoints are /v1/chat/completions, /v1/responses (OpenAI) and /v1/messages (Anthropic)",
+            request.uri().path()
+        ),
+    )
+        .into_response()
 }
 
 async fn healthz() -> &'static str {
@@ -73,11 +191,11 @@ async fn healthz() -> &'static str {
 }
 
 async fn reload_endpoint(State(shared): State<SharedGatewayState>, headers: HeaderMap) -> Response {
-    if !shared.load().is_authorized(&headers) {
+    if shared.load().authorize(&headers).is_none() {
         warn!("rejected unauthenticated gateway reload request");
         return (
             StatusCode::UNAUTHORIZED,
-            "missing or invalid gateway bearer token",
+            "missing or invalid API key",
         )
             .into_response();
     }
@@ -111,13 +229,44 @@ async fn proxy(State(shared): State<SharedGatewayState>, request: Request) -> Re
     let method = request.method().clone();
     let original_headers = request.headers().clone();
 
-    if !state.is_authorized(&original_headers) {
+    // The route table only sends fixed model-endpoint paths here.
+    let protocol = protocol_of(&path).expect("proxy only registered on protocol paths");
+
+    let Some(identity) = state.authorize(&original_headers) else {
         warn!(%request_id, %path, "rejected unauthenticated gateway request");
         return (
             StatusCode::UNAUTHORIZED,
-            "missing or invalid gateway bearer token",
+            "missing or invalid API key",
         )
             .into_response();
+    };
+
+    // Soft prepaid-quota gate: two counter reads, zero database access. Soft
+    // means in-flight requests may overshoot slightly; new requests stop here.
+    match state.check_quota(&identity).await {
+        crate::state::QuotaDecision::Allowed => {}
+        crate::state::QuotaDecision::UserExhausted { granted } => {
+            warn!(%request_id, %path, user_id = %identity.user_id, "rejected request: credit balance exhausted");
+            return protocol_error(
+                protocol,
+                StatusCode::PAYMENT_REQUIRED,
+                "insufficient_quota",
+                format!(
+                    "credit balance exhausted (granted {granted} USD); ask an administrator to grant more credit"
+                ),
+            );
+        }
+        crate::state::QuotaDecision::KeyCapReached { cap } => {
+            warn!(%request_id, %path, api_key_id = %identity.api_key_id, "rejected request: key spend cap reached");
+            return protocol_error(
+                protocol,
+                StatusCode::PAYMENT_REQUIRED,
+                "insufficient_quota",
+                format!(
+                    "this API key reached its spend cap ({cap} USD); raise or remove the cap to continue"
+                ),
+            );
+        }
     }
 
     let body = match to_bytes(request.into_body(), usize::MAX).await {
@@ -130,9 +279,58 @@ async fn proxy(State(shared): State<SharedGatewayState>, request: Request) -> Re
 
     let payload = RequestPayload::parse(&body);
 
-    let Some(route) = state.match_route(&path, payload.model.as_deref()) else {
-        warn!(%request_id, %path, "no gateway route matched");
-        return (StatusCode::NOT_FOUND, "no matching gateway route").into_response();
+    let Some(model) = payload.model.clone() else {
+        return protocol_error(
+            protocol,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "the request body must include a string `model` field".to_owned(),
+        );
+    };
+
+    // Resolution happens entirely in-memory, before any upstream contact:
+    // unknown/disabled model, key restriction, and protocol filtering all
+    // reject here with a protocol-native error body.
+    let chain = match state.resolve(protocol, &model, &identity) {
+        Resolution::Chain(chain) => chain,
+        Resolution::UnknownModel => {
+            warn!(%request_id, %path, %model, "requested model is not in the catalog");
+            return protocol_error(
+                protocol,
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                format!("model '{model}' does not exist or is not available"),
+            );
+        }
+        Resolution::Forbidden => {
+            warn!(%request_id, %path, %model, "api key is not allowed to call model");
+            return protocol_error(
+                protocol,
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                format!("this API key is not allowed to call model '{model}'"),
+            );
+        }
+        Resolution::WrongProtocol { available } => {
+            warn!(%request_id, %path, %model, "model has no deployment on this protocol");
+            let families = if available.is_empty() {
+                "no protocol".to_owned()
+            } else {
+                available
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return protocol_error(
+                protocol,
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                format!(
+                    "model '{model}' is not available on this endpoint (protocol {protocol}); it is served via: {families}"
+                ),
+            );
+        }
     };
 
     let ctx = ProxyContext {
@@ -144,51 +342,119 @@ async fn proxy(State(shared): State<SharedGatewayState>, request: Request) -> Re
         original_headers: &original_headers,
         body: &body,
         payload: &payload,
+        identity,
         started_at,
     };
 
     let mut last_error: Option<Response> = None;
-    let mut unresolved_model_alias = false;
 
-    let provider_count = route.provider_ids.len();
-    for (index, provider_id) in route.provider_ids.iter().enumerate() {
-        let Some(provider) = state.provider(provider_id) else {
-            // from_config guarantees every id resolves; skip defensively.
-            continue;
-        };
-
-        // The last provider in the chain has nowhere to fail over to, so a
+    let deployment_count = chain.len();
+    for (index, deployment) in chain.iter().enumerate() {
+        // The last deployment in the chain has nowhere to fail over to, so a
         // provider that exhausts its rate-limit retries forwards its real
         // response (e.g. 429) to the client instead of a synthesized 502.
-        let is_last = index + 1 == provider_count;
-        match ctx.attempt_provider(provider, is_last).await {
+        let is_last = index + 1 == deployment_count;
+        match ctx
+            .attempt_provider(deployment.provider, deployment.upstream_model, is_last)
+            .await
+        {
             ProviderAttempt::Forward(response) => return response,
             ProviderAttempt::Failover(response) => last_error = Some(response),
-            ProviderAttempt::AliasMissing => unresolved_model_alias = true,
         }
     }
 
-    last_error.unwrap_or_else(|| {
-        if unresolved_model_alias {
-            (
-                StatusCode::BAD_GATEWAY,
-                "no provider could resolve model alias",
-            )
-                .into_response()
-        } else {
-            (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
-        }
-    })
+    last_error
+        .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "upstream request failed").into_response())
 }
 
-/// The outcome of attempting a single provider in a route's failover chain.
+/// A protocol-native JSON error body, so clients see the error shape their SDK
+/// expects. `kind` follows Anthropic's error type vocabulary; the OpenAI shape
+/// carries it as `code`.
+fn protocol_error(
+    protocol: Protocol,
+    status: StatusCode,
+    kind: &str,
+    message: String,
+) -> Response {
+    let body = match protocol {
+        Protocol::OpenAi => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": kind,
+            }
+        }),
+        Protocol::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": { "type": kind, "message": message }
+        }),
+    };
+    (
+        status,
+        [(CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Gateway-owned `GET /v1/models`: the enabled catalog scoped to the key. The
+/// response shape follows the caller's endpoint family — Anthropic's when the
+/// request carries an `anthropic-version` header, OpenAI's otherwise.
+async fn list_models(State(shared): State<SharedGatewayState>, headers: HeaderMap) -> Response {
+    let state = shared.load();
+    let Some(identity) = state.authorize(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key",
+        )
+            .into_response();
+    };
+
+    let models = state.listable_models(&identity);
+    let body = if headers.contains_key("anthropic-version") {
+        serde_json::json!({
+            "data": models
+                .iter()
+                .map(|(name, entry)| serde_json::json!({
+                    "type": "model",
+                    "id": name,
+                    "display_name": name,
+                    "created_at": entry.created_at.to_rfc3339(),
+                }))
+                .collect::<Vec<_>>(),
+            "first_id": models.first().map(|(name, _)| *name),
+            "last_id": models.last().map(|(name, _)| *name),
+            "has_more": false,
+        })
+    } else {
+        serde_json::json!({
+            "object": "list",
+            "data": models
+                .iter()
+                .map(|(name, entry)| serde_json::json!({
+                    "id": name,
+                    "object": "model",
+                    "created": entry.created_at.timestamp(),
+                    "owned_by": "lite-agentify",
+                }))
+                .collect::<Vec<_>>(),
+        })
+    };
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// The outcome of attempting a single deployment in a model's failover chain.
 enum ProviderAttempt {
-    /// A terminal response to forward to the client; no further providers are tried.
+    /// A terminal response to forward to the client; no further deployments are tried.
     Forward(Response),
-    /// A recoverable failure (transport error or HTTP 5xx); record and try the next provider.
+    /// A recoverable failure (transport error or HTTP 5xx); record and try the next deployment.
     Failover(Response),
-    /// The provider has model aliases but does not define the requested alias; skip it.
-    AliasMissing,
 }
 
 /// Shared, immutable request context for a single proxied request, passed to
@@ -202,33 +468,30 @@ struct ProxyContext<'a> {
     original_headers: &'a HeaderMap,
     body: &'a Bytes,
     payload: &'a RequestPayload,
+    identity: crate::account::KeyIdentity,
     started_at: Instant,
 }
 
 impl ProxyContext<'_> {
-    /// Attempts one provider, retrying it in place on a configured rate-limit
-    /// status (default 429/529) with backoff before giving up. `is_last`
-    /// forwards an exhausted rate-limit response to the client rather than
-    /// failing over to a non-existent next provider.
-    async fn attempt_provider(&self, provider: &Provider, is_last: bool) -> ProviderAttempt {
+    /// Attempts one deployment, retrying its provider in place on a configured
+    /// rate-limit status (default 429/529) with backoff before giving up.
+    /// `is_last` forwards an exhausted rate-limit response to the client rather
+    /// than failing over to a non-existent next deployment.
+    async fn attempt_provider(
+        &self,
+        provider: &Provider,
+        upstream_model: &str,
+        is_last: bool,
+    ) -> ProviderAttempt {
         let request_id = self.request_id;
         let path = self.path;
 
-        let provider_body = match body_for_provider(self.body, self.payload, provider) {
-            Ok(Some(body)) => body,
-            Ok(None) => {
-                warn!(
-                    %request_id,
-                    %path,
-                    provider = %provider.id,
-                    "provider does not define requested model alias"
-                );
-                return ProviderAttempt::AliasMissing;
-            }
+        let provider_body = match body_for_deployment(self.body, self.payload, upstream_model) {
+            Ok(body) => body,
             Err(error) => {
-                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to resolve model alias");
+                warn!(%request_id, %path, provider = %provider.id, error = %error, "failed to rewrite request body for deployment");
                 return ProviderAttempt::Forward(
-                    (StatusCode::BAD_REQUEST, "failed to resolve model alias").into_response(),
+                    (StatusCode::BAD_REQUEST, "failed to rewrite request body").into_response(),
                 );
             }
         };
@@ -418,6 +681,8 @@ impl ProxyContext<'_> {
             provider_id: provider.id.clone(),
             protocol: provider.protocol,
             path: path.to_owned(),
+            user_id: Some(self.identity.user_id),
+            api_key_id: Some(self.identity.api_key_id),
             requested_model: provider_body.requested_model,
             upstream_model: provider_body.upstream_model,
             status: status.as_u16(),
@@ -460,6 +725,8 @@ struct UsageMetadata {
     provider_id: String,
     protocol: Protocol,
     path: String,
+    user_id: Option<uuid::Uuid>,
+    api_key_id: Option<uuid::Uuid>,
     requested_model: Option<String>,
     upstream_model: Option<String>,
     status: u16,
@@ -489,12 +756,31 @@ async fn record_usage(
         .map(|(cost, currency, pricing_source)| (Some(cost), Some(currency), pricing_source))
         .unwrap_or((None, None, None));
 
+    // Advance the spend counters off the response path so the next quota
+    // check sees this request's cost. NULL costs (unpriced history) add zero.
+    if let Some(cost) = estimated_cost {
+        if let Some(user_id) = metadata.user_id {
+            state
+                .spend_counter
+                .add(crate::quota::Scope::User(user_id), cost)
+                .await;
+        }
+        if let Some(api_key_id) = metadata.api_key_id {
+            state
+                .spend_counter
+                .add(crate::quota::Scope::Key(api_key_id), cost)
+                .await;
+        }
+    }
+
     let record = UsageRecord {
         request_id: metadata.request_id,
         created_at: Utc::now(),
         provider_id: metadata.provider_id,
         protocol: metadata.protocol,
         path: metadata.path,
+        user_id: metadata.user_id,
+        api_key_id: metadata.api_key_id,
         requested_model: metadata.requested_model,
         upstream_model: metadata.upstream_model,
         status: metadata.status,
@@ -614,48 +900,43 @@ struct ProviderBody {
     upstream_model: Option<String>,
 }
 
-fn body_for_provider(
+/// Rewrites the request body's top-level `model` to the deployment's upstream
+/// name. When the requested name already matches, the original bytes pass
+/// through untouched (no re-serialization).
+fn body_for_deployment(
     body: &Bytes,
     payload: &RequestPayload,
-    provider: &Provider,
-) -> anyhow::Result<Option<ProviderBody>> {
+    upstream_model: &str,
+) -> anyhow::Result<ProviderBody> {
     let requested_model = payload.model.clone();
-    if provider.model_aliases.is_empty() || body.is_empty() {
-        return Ok(Some(ProviderBody {
+    if requested_model.as_deref() == Some(upstream_model) {
+        return Ok(ProviderBody {
             body: body.clone(),
-            upstream_model: requested_model.clone(),
             requested_model,
-        }));
+            upstream_model: Some(upstream_model.to_owned()),
+        });
     }
 
-    // Provider has aliases and the body is non-empty: a non-empty body that did
-    // not parse as JSON is a request error, matching the previous behavior.
+    // The proxy only resolves requests whose payload carried a model, so the
+    // JSON value is present; guard defensively anyway.
     let Some(value) = payload.json.as_ref() else {
-        bail!("failed to parse JSON request body");
+        bail!("request body is not a JSON object");
     };
-    let Some(model) = value.get("model").and_then(Value::as_str) else {
-        return Ok(Some(ProviderBody {
-            body: body.clone(),
-            upstream_model: requested_model.clone(),
-            requested_model,
-        }));
-    };
-    let Some(upstream_model) = provider.model_aliases.get(model) else {
-        return Ok(None);
-    };
-
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
-        object.insert("model".to_owned(), Value::String(upstream_model.clone()));
+        object.insert(
+            "model".to_owned(),
+            Value::String(upstream_model.to_owned()),
+        );
     }
 
-    Ok(Some(ProviderBody {
+    Ok(ProviderBody {
         body: Bytes::from(
             serde_json::to_vec(&value).context("failed to serialize JSON request body")?,
         ),
         requested_model,
-        upstream_model: Some(upstream_model.clone()),
-    }))
+        upstream_model: Some(upstream_model.to_owned()),
+    })
 }
 
 /// Parses a `Retry-After` header into milliseconds. Handles both the

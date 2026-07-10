@@ -1,16 +1,16 @@
+mod account_api;
 mod assets;
-mod config_api;
-mod password;
+mod catalog_api;
+mod credits_api;
+mod models_api;
+pub(crate) mod password;
+mod session;
 mod usage_api;
 
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -20,39 +20,84 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
+use uuid::Uuid;
 
-use crate::reload::SharedGatewayState;
+use crate::{
+    account::{AccountStore, Role, UserStatus},
+    catalog::CatalogStore,
+    pubsub::ConfigNotifier,
+    reload::SharedGatewayState,
+};
 
 pub use password::bootstrap_admin_password;
+pub(crate) use session::{MemorySessionStore, RedisSessionStore, SessionStore};
+#[cfg(test)]
+use session::LOCKOUT_WINDOW;
 
 const SESSION_COOKIE: &str = "lite_agentify_admin";
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const LOCKOUT_THRESHOLD: u32 = 5;
-const LOCKOUT_WINDOW: Duration = Duration::from_secs(60);
 
-/// State for the admin console. Sessions and the login limiter live here —
-/// beside, not inside, the arc-swapped gateway state — so a config hot reload
-/// never invalidates sessions.
+/// The authenticated caller attached to each admin request by the session
+/// middleware. Serialized as the session payload in Redis mode.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SessionIdentity {
+    pub user_id: Uuid,
+    pub username: String,
+    pub role: Role,
+}
+
+/// State for the admin console. Sessions and the login limiter live behind
+/// [`SessionStore`] — beside, not inside, the arc-swapped gateway state — so
+/// a config hot reload never invalidates sessions.
 #[derive(Clone)]
 pub(crate) struct AdminState {
     shared: SharedGatewayState,
-    sessions: Arc<Mutex<HashMap<String, Instant>>>,
-    limiter: Arc<Mutex<LoginLimiter>>,
+    store: Arc<dyn AccountStore>,
+    catalog: Arc<dyn CatalogStore>,
+    quota: Arc<dyn crate::quota::QuotaStore>,
+    sessions: Arc<dyn SessionStore>,
+    notifier: Option<ConfigNotifier>,
     session_ttl: Duration,
 }
 
 impl AdminState {
-    fn new(shared: SharedGatewayState) -> Self {
-        Self::with_timing(shared, SESSION_TTL, LOCKOUT_WINDOW)
-    }
-
-    fn with_timing(shared: SharedGatewayState, session_ttl: Duration, lockout: Duration) -> Self {
+    fn new(
+        shared: SharedGatewayState,
+        store: Arc<dyn AccountStore>,
+        catalog: Arc<dyn CatalogStore>,
+        quota: Arc<dyn crate::quota::QuotaStore>,
+        sessions: Arc<dyn SessionStore>,
+        notifier: Option<ConfigNotifier>,
+    ) -> Self {
         Self {
             shared,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            limiter: Arc::new(Mutex::new(LoginLimiter::new(lockout))),
+            store,
+            catalog,
+            quota,
+            sessions,
+            notifier,
+            session_ttl: SESSION_TTL,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timing(
+        shared: SharedGatewayState,
+        store: Arc<dyn AccountStore>,
+        catalog: Arc<dyn CatalogStore>,
+        quota: Arc<dyn crate::quota::QuotaStore>,
+        session_ttl: Duration,
+        lockout: Duration,
+    ) -> Self {
+        Self {
+            shared,
+            store,
+            catalog,
+            quota,
+            sessions: Arc::new(MemorySessionStore::new(lockout)),
+            notifier: None,
             session_ttl,
         }
     }
@@ -61,74 +106,95 @@ impl AdminState {
         &self.shared
     }
 
-    fn open_session(&self) -> String {
+    pub(crate) fn store(&self) -> &Arc<dyn AccountStore> {
+        &self.store
+    }
+
+    pub(crate) fn catalog(&self) -> &Arc<dyn CatalogStore> {
+        &self.catalog
+    }
+
+    pub(crate) fn quota(&self) -> &Arc<dyn crate::quota::QuotaStore> {
+        &self.quota
+    }
+
+    /// Announces a snapshot-affecting mutation on the reserved pub/sub
+    /// channel (no-op without Redis; see `pubsub.rs`).
+    fn notify_config_changed(&self, what: &'static str) {
+        if let Some(notifier) = &self.notifier {
+            notifier.publish(what);
+        }
+    }
+
+    /// Reloads the per-user granted sums into the snapshot after a grant
+    /// mutation, so balance checks see the new credit immediately.
+    pub(crate) async fn refresh_granted(&self) -> anyhow::Result<()> {
+        let granted = self.quota.grant_sums().await?;
+        self.shared.store_granted(granted);
+        self.notify_config_changed("granted");
+        Ok(())
+    }
+
+    /// Rebuilds the gateway snapshot from the current database catalog after a
+    /// provider or pricing mutation. Returns an error (without swapping) when
+    /// the new catalog fails validation, e.g. a route references a deleted
+    /// provider.
+    pub(crate) async fn refresh_catalog(&self) -> anyhow::Result<()> {
+        let snapshot = self.catalog.snapshot().await?;
+        self.shared.store_catalog(snapshot)?;
+        self.notify_config_changed("catalog");
+        Ok(())
+    }
+
+    /// Reloads the hot-path key map from the store after an account mutation.
+    /// A failure is logged and surfaced so callers can report it: the database
+    /// write has already committed and the next rebuild converges.
+    pub(crate) async fn refresh_api_keys(&self) -> anyhow::Result<()> {
+        let map = self.store.active_key_map().await?;
+        self.shared.store_api_keys(map);
+        self.notify_config_changed("api_keys");
+        Ok(())
+    }
+
+    /// Invalidates every session belonging to `user_id` (user disabled or
+    /// password reset). A backend failure is logged loudly: the sessions can
+    /// only resurface after the backend recovers, since reads during the
+    /// outage fail closed.
+    pub(crate) async fn drop_user_sessions(&self, user_id: Uuid) {
+        if let Err(error) = self.sessions.remove_user(user_id).await {
+            tracing::error!(
+                error = format!("{error:#}"),
+                %user_id,
+                "failed to invalidate the user's sessions; they lapse at their TTL"
+            );
+        }
+    }
+
+    async fn open_session(&self, identity: SessionIdentity) -> anyhow::Result<String> {
         let token = random_token();
-        let expires_at = Instant::now() + self.session_ttl;
         self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), expires_at);
-        token
+            .open(&token, &identity, self.session_ttl)
+            .await?;
+        Ok(token)
     }
 
-    /// Validates a session token, lazily removing it once expired.
-    fn session_is_valid(&self, token: &str) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        match sessions.get(token) {
-            Some(expires_at) if *expires_at > Instant::now() => true,
-            Some(_) => {
-                sessions.remove(token);
-                false
+    /// Validates a session token; a session-backend outage reads as signed
+    /// out (fail closed).
+    async fn session_identity(&self, token: &str) -> Option<SessionIdentity> {
+        match self.sessions.get(token).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    "session lookup failed; failing closed"
+                );
+                None
             }
-            None => false,
         }
     }
 
-    fn close_session(&self, token: &str) {
-        self.sessions.lock().unwrap().remove(token);
-    }
-}
-
-/// Global (not per-IP) lockout: after `LOCKOUT_THRESHOLD` consecutive failures
-/// every login is rejected for the lockout window. Client IPs are unreliable
-/// behind proxies, and a global lock is strictly safer for a single admin.
-struct LoginLimiter {
-    consecutive_failures: u32,
-    locked_until: Option<Instant>,
-    lockout: Duration,
-}
-
-impl LoginLimiter {
-    fn new(lockout: Duration) -> Self {
-        Self {
-            consecutive_failures: 0,
-            locked_until: None,
-            lockout,
-        }
-    }
-
-    fn is_locked(&mut self) -> bool {
-        match self.locked_until {
-            Some(until) if until > Instant::now() => true,
-            Some(_) => {
-                self.locked_until = None;
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn register_failure(&mut self) {
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= LOCKOUT_THRESHOLD {
-            self.locked_until = Some(Instant::now() + self.lockout);
-            self.consecutive_failures = 0;
-        }
-    }
-
-    fn reset(&mut self) {
-        self.consecutive_failures = 0;
-        self.locked_until = None;
+    async fn close_session(&self, token: &str) {
+        self.sessions.remove(token).await;
     }
 }
 
@@ -144,37 +210,85 @@ fn random_token() -> String {
     })
 }
 
-/// The admin console router, mounted at `/admin`. When no admin password is
-/// configured the prefix is still reserved but everything responds 404.
-pub(crate) fn admin_router(shared: &SharedGatewayState) -> Router {
-    if shared.load().admin_password.is_none() {
-        return disabled_router();
-    }
-    admin_router_with_state(AdminState::new(shared.clone()))
-}
-
-fn disabled_router() -> Router {
-    Router::new().fallback(|| async {
-        (
-            StatusCode::NOT_FOUND,
-            "admin console is disabled; set admin_password in the gateway config to enable it",
-        )
-    })
+/// The admin console router, mounted at `/admin`. Always enabled: user
+/// accounts live in the database and the bootstrap admin is guaranteed to
+/// exist after startup.
+pub(crate) fn admin_router(
+    shared: &SharedGatewayState,
+    store: Arc<dyn AccountStore>,
+    catalog: Arc<dyn CatalogStore>,
+    quota: Arc<dyn crate::quota::QuotaStore>,
+    sessions: Arc<dyn SessionStore>,
+    notifier: Option<ConfigNotifier>,
+) -> Router {
+    admin_router_with_state(AdminState::new(
+        shared.clone(),
+        store,
+        catalog,
+        quota,
+        sessions,
+        notifier,
+    ))
 }
 
 fn admin_router_with_state(state: AdminState) -> Router {
     Router::new()
-        .route(
-            "/api/config",
-            get(config_api::get_config).put(config_api::put_config),
-        )
-        .route(
-            "/api/config/structured",
-            put(config_api::put_config_structured),
-        )
-        .route("/api/config/reveal", post(config_api::reveal_secret))
         .route("/api/usage", get(usage_api::list_usage))
         .route("/api/usage/summary", get(usage_api::usage_summary))
+        .route("/api/me", get(account_api::me))
+        .route("/api/me/password", post(account_api::change_own_password))
+        .route(
+            "/api/users",
+            get(account_api::list_users).post(account_api::create_user),
+        )
+        .route("/api/users/{id}/disable", post(account_api::disable_user))
+        .route("/api/users/{id}/enable", post(account_api::enable_user))
+        .route(
+            "/api/users/{id}/reset-password",
+            post(account_api::reset_password),
+        )
+        .route(
+            "/api/keys",
+            get(account_api::list_keys).post(account_api::create_key),
+        )
+        .route("/api/keys/{id}", put(account_api::update_key))
+        .route("/api/keys/{id}/revoke", post(account_api::revoke_key))
+        .route(
+            "/api/providers",
+            get(catalog_api::list_providers).post(catalog_api::create_provider),
+        )
+        .route(
+            "/api/providers/{id}",
+            put(catalog_api::update_provider).delete(catalog_api::delete_provider),
+        )
+        .route(
+            "/api/providers/{id}/reveal",
+            post(catalog_api::reveal_provider_key),
+        )
+        .route(
+            "/api/pricing",
+            get(catalog_api::list_pricing).post(catalog_api::create_pricing),
+        )
+        .route(
+            "/api/pricing/{id}",
+            put(catalog_api::update_pricing).delete(catalog_api::delete_pricing),
+        )
+        .route(
+            "/api/models",
+            get(models_api::list_models).post(models_api::create_model),
+        )
+        .route("/api/models/names", get(models_api::list_model_names))
+        .route(
+            "/api/models/{name}",
+            put(models_api::update_model).delete(models_api::delete_model),
+        )
+        .route(
+            "/api/credits",
+            get(credits_api::list_balances),
+        )
+        .route("/api/credits/grants", post(credits_api::create_grant))
+        .route("/api/credits/ledger", get(credits_api::list_ledger))
+        .route("/api/me/balance", get(credits_api::my_balance))
         .route("/api/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -187,15 +301,27 @@ fn admin_router_with_state(state: AdminState) -> Router {
 
 async fn require_session(
     State(state): State<AdminState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let authorized = session_cookie(request.headers())
-        .is_some_and(|token| state.session_is_valid(&token));
-    if !authorized {
+    let identity = match session_cookie(request.headers()) {
+        Some(token) => state.session_identity(&token).await,
+        None => None,
+    };
+    let Some(identity) = identity else {
         return (StatusCode::UNAUTHORIZED, "admin session required").into_response();
-    }
+    };
+    request.extensions_mut().insert(identity);
     next.run(request).await
+}
+
+/// Guard for admin-only endpoints: `Err` carries the 403 response.
+pub(crate) fn require_admin(identity: &SessionIdentity) -> Result<(), Response> {
+    if identity.role == Role::Admin {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin role required").into_response())
+    }
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -217,12 +343,16 @@ fn set_cookie_header(token: &str, max_age_secs: i64) -> String {
 
 #[derive(Deserialize)]
 struct LoginRequest {
+    username: String,
     password: String,
 }
 
+/// Identical rejection for unknown username, disabled user, and wrong
+/// password, with a dummy argon2 verification on the missing-user path so
+/// response timing does not reveal whether a username exists.
 async fn login(State(state): State<AdminState>, Json(request): Json<LoginRequest>) -> Response {
-    if state.limiter.lock().unwrap().is_locked() {
-        warn!("admin login rejected: lockout window active");
+    if state.sessions.is_locked(&request.username).await {
+        warn!(username = %request.username, "login rejected: lockout window active");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed login attempts; try again later",
@@ -230,30 +360,74 @@ async fn login(State(state): State<AdminState>, Json(request): Json<LoginRequest
             .into_response();
     }
 
-    let Some(stored) = state.shared.load().admin_password.clone() else {
-        warn!("admin login attempted but no admin_password is configured");
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+    let user = match state.store.find_user_by_username(&request.username).await {
+        Ok(user) => user,
+        Err(error) => {
+            warn!(error = format!("{error:#}"), "login user lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response();
+        }
     };
 
-    if !password::verify_password(&stored, &request.password) {
-        state.limiter.lock().unwrap().register_failure();
-        warn!("admin login failed: invalid password");
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+    let verified = match &user {
+        Some(user) => {
+            password::verify_password(&user.password_hash, &request.password)
+                && user.status == UserStatus::Active
+        }
+        None => {
+            password::verify_password(dummy_hash(), &request.password);
+            false
+        }
+    };
+
+    if !verified {
+        state.sessions.register_failure(&request.username).await;
+        warn!(username = %request.username, "login failed: invalid credentials");
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
 
-    state.limiter.lock().unwrap().reset();
-    let token = state.open_session();
+    let user = user.expect("verified implies user exists");
+    state.sessions.clear_failures(&request.username).await;
+    let identity = SessionIdentity {
+        user_id: user.id,
+        username: user.username.clone(),
+        role: user.role,
+    };
+    let token = match state.open_session(identity).await {
+        Ok(token) => token,
+        Err(error) => {
+            // Fail closed: no session persisted means no cookie is issued.
+            warn!(
+                error = format!("{error:#}"),
+                "login verified but the session could not be stored"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response();
+        }
+    };
     let ttl_secs = state.session_ttl.as_secs() as i64;
     (
         [(header::SET_COOKIE, set_cookie_header(&token, ttl_secs))],
-        Json(serde_json::json!({ "ok": true })),
+        Json(serde_json::json!({
+            "ok": true,
+            "username": user.username,
+            "role": user.role,
+        })),
     )
         .into_response()
 }
 
+/// A constant argon2id hash of an unguessable value, verified against on the
+/// unknown-username path so both login failures cost the same time.
+fn dummy_hash() -> &'static str {
+    use std::sync::OnceLock;
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        password::hash_password(&random_token()).unwrap_or_else(|_| "$argon2id$invalid".to_owned())
+    })
+}
+
 async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(token) = session_cookie(&headers) {
-        state.close_session(&token);
+        state.close_session(&token).await;
     }
     (
         [(header::SET_COOKIE, set_cookie_header("", 0))],

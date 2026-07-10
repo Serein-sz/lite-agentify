@@ -14,6 +14,8 @@ pub(crate) mod usage_record {
         pub provider_id: String,
         pub protocol: String,
         pub path: String,
+        pub user_id: Option<Uuid>,
+        pub api_key_id: Option<Uuid>,
         pub requested_model: Option<String>,
         pub upstream_model: Option<String>,
         pub status: i32,

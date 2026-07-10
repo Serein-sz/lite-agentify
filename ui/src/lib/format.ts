@@ -46,6 +46,18 @@ export function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+/** 后端 Decimal 字符串(如 "12.5000000000")→ 展示金额,最多 4 位小数。 */
+export function formatUsd(amount: string | null | undefined): string {
+  if (amount === null || amount === undefined || amount === "") {
+    return "—";
+  }
+  const value = Number(amount);
+  if (!Number.isFinite(value)) {
+    return amount;
+  }
+  return `${value.toLocaleString("zh-CN", { maximumFractionDigits: 4 })} USD`;
+}
+
 export function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }

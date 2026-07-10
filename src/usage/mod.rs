@@ -13,7 +13,7 @@ pub(crate) use query::{
 };
 pub(crate) use record::UsageRecord;
 pub(crate) use recorder::{
-    NoopUsageRecorder, UsageRecorder, recorder_from_config, warn_record_error,
+    NoopUsageRecorder, UsageRecorder, recorder_from_db, warn_record_error,
 };
 pub(crate) use source::UsageSource;
 

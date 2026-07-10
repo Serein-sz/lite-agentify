@@ -1,9 +1,14 @@
+mod account;
 mod admin;
+mod catalog;
 mod config;
+mod db;
 mod domain;
 mod model;
 mod pricing;
 mod proxy;
+mod pubsub;
+mod quota;
 mod reload;
 mod state;
 mod usage;

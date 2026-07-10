@@ -10,7 +10,7 @@ use notify::{RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 
 use crate::{
-    config::{GatewayConfig, UsageDatabaseConfig},
+    config::{DatabaseConfig, GatewayConfig},
     state::GatewayState,
 };
 
@@ -27,6 +27,10 @@ pub struct SharedGatewayState {
 struct Inner {
     state: ArcSwap<GatewayState>,
     reload: Option<ReloadContext>,
+    /// Database-sourced provider + pricing config that seeds the snapshot.
+    /// Carried across file reloads (which only re-read routes and retry) and
+    /// replaced when the provider/pricing management APIs mutate the database.
+    catalog: ArcSwap<crate::catalog::CatalogSnapshot>,
 }
 
 /// Boot-time values a reload needs: the file to re-read, and the
@@ -34,19 +38,25 @@ struct Inner {
 struct ReloadContext {
     config_path: PathBuf,
     listen_addr: std::net::SocketAddr,
-    usage_database: Option<UsageDatabaseConfig>,
+    database: Option<DatabaseConfig>,
 }
 
 impl SharedGatewayState {
-    pub(crate) fn new(state: GatewayState, config: &GatewayConfig, config_path: PathBuf) -> Self {
+    pub(crate) fn new(
+        state: GatewayState,
+        config: &GatewayConfig,
+        config_path: PathBuf,
+        catalog: crate::catalog::CatalogSnapshot,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: ArcSwap::from_pointee(state),
                 reload: Some(ReloadContext {
                     config_path,
                     listen_addr: config.listen_addr,
-                    usage_database: config.usage_database.clone(),
+                    database: config.database.clone(),
                 }),
+                catalog: ArcSwap::from_pointee(catalog),
             }),
         }
     }
@@ -58,6 +68,7 @@ impl SharedGatewayState {
             inner: Arc::new(Inner {
                 state: ArcSwap::from_pointee(state),
                 reload: None,
+                catalog: ArcSwap::from_pointee(crate::catalog::CatalogSnapshot::default()),
             }),
         }
     }
@@ -70,34 +81,58 @@ impl SharedGatewayState {
         self.inner.state.store(Arc::new(state));
     }
 
-    /// The config file this instance boots from and reloads, when hot reload
-    /// is configured.
-    pub(crate) fn config_path(&self) -> Option<&Path> {
-        self.inner
-            .reload
-            .as_ref()
-            .map(|context| context.config_path.as_path())
+    /// Swaps in the same snapshot with a fresh key map. Called after account
+    /// mutations so key/user changes take effect without re-reading the file.
+    pub(crate) fn store_api_keys(&self, api_keys: crate::account::ApiKeyMap) {
+        let next = self.load().with_api_keys(api_keys);
+        self.store(next);
     }
 
-    /// Human-readable warnings for config fields that only take effect after
-    /// a restart, comparing a candidate config against the boot-time values.
-    pub(crate) fn restart_required_warnings(&self, config: &GatewayConfig) -> Vec<String> {
-        let Some(context) = self.inner.reload.as_ref() else {
-            return Vec::new();
-        };
-        let mut warnings = Vec::new();
-        if config.listen_addr != context.listen_addr {
-            warnings.push(format!(
-                "listen_addr changed from {} to {}; this change requires a restart to take effect",
-                context.listen_addr, config.listen_addr
-            ));
-        }
-        if config.usage_database != context.usage_database {
-            warnings.push(
-                "usage_database changed; this change requires a restart to take effect".to_owned(),
-            );
-        }
-        warnings
+    /// Swaps in the same snapshot with a fresh granted-credit map. Called
+    /// after grant mutations so balances take effect immediately.
+    pub(crate) fn store_granted(
+        &self,
+        granted: std::collections::HashMap<uuid::Uuid, rust_decimal::Decimal>,
+    ) {
+        let next = self.load().with_granted(granted);
+        self.store(next);
+    }
+
+    /// The active database-sourced provider + pricing configuration.
+    pub(crate) fn catalog(&self) -> Arc<crate::catalog::CatalogSnapshot> {
+        self.inner.catalog.load_full()
+    }
+
+    /// Replaces the cached catalog and rebuilds the gateway snapshot from it
+    /// plus the current file config (retry). Called after a provider, pricing,
+    /// or model mutation. Returns an error without swapping if the new catalog
+    /// fails validation (e.g. a deployment now references a missing provider),
+    /// leaving the previous snapshot serving.
+    pub(crate) fn store_catalog(
+        &self,
+        catalog: crate::catalog::CatalogSnapshot,
+    ) -> anyhow::Result<()> {
+        let context = self
+            .inner
+            .reload
+            .as_ref()
+            .context("catalog refresh requires hot reload to be configured")?;
+        let config = GatewayConfig::load_from_path(&context.config_path)?;
+
+        let current = self.load();
+        let next = GatewayState::from_parts(
+            config,
+            catalog.clone(),
+            current.upstream.clone(),
+            current.usage_recorder.clone(),
+        )?
+        .with_api_keys((*current.api_keys).clone())
+        .with_granted((*current.granted).clone())
+        .with_spend_counter(current.spend_counter.clone());
+
+        self.inner.catalog.store(Arc::new(catalog));
+        self.store(next);
+        Ok(())
     }
 }
 
@@ -117,16 +152,27 @@ pub(crate) fn reload(shared: &SharedGatewayState) -> anyhow::Result<()> {
             "listen_addr changed in config file; change requires a restart to take effect"
         );
     }
-    if config.usage_database != context.usage_database {
-        warn!("usage_database changed in config file; change requires a restart to take effect");
+    if config.database != context.database {
+        warn!("database changed in config file; change requires a restart to take effect");
     }
 
+    // Providers, pricing, and the model catalog come from the database, not
+    // the file: overlay the cached catalog so a file reload only re-reads the
+    // retry policy (and warns about restart-only fields).
+    let catalog = shared.catalog();
+
     let current = shared.load();
-    let next = GatewayState::from_config_with_upstream_and_recorder(
+    let next = GatewayState::from_parts(
         config,
+        (*catalog).clone(),
         current.upstream.clone(),
         current.usage_recorder.clone(),
-    )?;
+    )?
+    // A file reload never changes accounts, balances, or counters: carry the
+    // database-owned state over.
+    .with_api_keys((*current.api_keys).clone())
+    .with_granted((*current.granted).clone())
+    .with_spend_counter(current.spend_counter.clone());
     shared.store(next);
 
     info!(

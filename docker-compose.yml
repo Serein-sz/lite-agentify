@@ -19,15 +19,35 @@ services:
       LITE_AGENTIFY_GATEWAY_CONFIG: /config/lite-agentify.toml
     networks:
       - cpa-net
-    # In lite-agentify.toml, reach the DB over cpa-net by the container's
-    # hostname `postgres` (NOT localhost). The postgres container's credentials
-    # are user=serein / db=serein_db, e.g.:
-    #   [usage_database]
-    #   enabled = true
+    # PostgreSQL is REQUIRED: accounts, API keys, and usage records live there
+    # and the gateway refuses to start without it. In lite-agentify.toml, reach
+    # the DB over cpa-net by the container's hostname `postgres` (NOT localhost).
+    # The postgres container's credentials are user=serein / db=serein_db, e.g.:
+    #   [database]
     #   url = "postgres://serein:<password>@postgres:5432/serein_db"
+
+  # OPTIONAL Redis hot-state backend (spend counters, admin sessions, login
+  # lockout). Uncomment and add to lite-agentify.toml:
+  #   [redis]
+  #   url = "redis://:<strong-password>@redis:6379/0"
+  # Session tokens live here — use a STRONG password (requirepass) and do NOT
+  # publish the port beyond the compose network. The gateway runs fine
+  # without this service; state then stays in process memory.
+  # redis:
+  #   image: redis:8-alpine
+  #   container_name: lite-agentify-redis
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--requirepass", "<strong-password>"]
+  #   volumes:
+  #     - redis-data:/data
+  #   networks:
+  #     - cpa-net
 
 networks:
   # Pre-existing bridge network the postgres container is attached to.
   cpa-net:
     external: true
     name: cpa-net
+
+# volumes:
+#   redis-data:

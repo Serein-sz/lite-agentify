@@ -1,13 +1,19 @@
-import { NavLink, Outlet, Route, Routes, useNavigate } from "react-router";
-import { useMutation } from "@tanstack/react-query";
+import { NavLink, Navigate, Outlet, Route, Routes, useNavigate } from "react-router";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Waypoints } from "lucide-react";
-import { api } from "./api";
+import { api, type Me } from "./api";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { cn } from "@/lib/utils";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
-import ConfigPage from "./pages/ConfigPage";
+import KeysPage from "./pages/KeysPage";
+import UsersPage from "./pages/UsersPage";
+import PasswordPage from "./pages/PasswordPage";
+import ProvidersPage from "./pages/ProvidersPage";
+import PricingPage from "./pages/PricingPage";
+import ModelsPage from "./pages/ModelsPage";
+import CreditsPage from "./pages/CreditsPage";
 
 function TabLink({ to, label }: { to: string; label: string }) {
   return (
@@ -28,8 +34,9 @@ function TabLink({ to, label }: { to: string; label: string }) {
   );
 }
 
-function Layout() {
+function Layout({ me }: { me: Me }) {
   const navigate = useNavigate();
+  const isAdmin = me.role === "admin";
   const logout = useMutation({
     mutationFn: api.logout,
     onSettled: () => navigate("/login"),
@@ -47,9 +54,21 @@ function Layout() {
           </span>
           <nav className="flex gap-1">
             <TabLink to="/" label="仪表盘" />
-            <TabLink to="/config" label="配置" />
+            <TabLink to="/keys" label="密钥" />
+            {isAdmin && <TabLink to="/users" label="用户" />}
+            {isAdmin && <TabLink to="/credits" label="额度" />}
+            {isAdmin && <TabLink to="/models" label="模型" />}
+            {isAdmin && <TabLink to="/providers" label="Provider" />}
+            {isAdmin && <TabLink to="/pricing" label="定价" />}
+            <TabLink to="/password" label="修改密码" />
           </nav>
-          <div className="ml-auto flex items-center gap-1">
+          <div className="ml-auto flex items-center gap-3">
+            <span className="text-xs text-muted-foreground">
+              {me.username}
+              <span className="ml-1 rounded bg-muted px-1.5 py-0.5">
+                {isAdmin ? "管理员" : "用户"}
+              </span>
+            </span>
             <ThemeToggle />
             <Button
               variant="ghost"
@@ -69,14 +88,60 @@ function Layout() {
   );
 }
 
+/** Loads the current session identity; unauthenticated users go to login. */
+function AuthedApp() {
+  const navigate = useNavigate();
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
+
+  if (me.isLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        加载中…
+      </div>
+    );
+  }
+  if (me.isError || !me.data) {
+    navigate("/login", { replace: true });
+    return null;
+  }
+
+  const isAdmin = me.data.role === "admin";
+  return (
+    <Routes>
+      <Route element={<Layout me={me.data} />}>
+        <Route index element={<DashboardPage role={me.data.role} />} />
+        <Route path="keys" element={<KeysPage role={me.data.role} />} />
+        <Route path="password" element={<PasswordPage />} />
+        <Route
+          path="users"
+          element={isAdmin ? <UsersPage /> : <Navigate to="/" replace />}
+        />
+        <Route
+          path="credits"
+          element={isAdmin ? <CreditsPage /> : <Navigate to="/" replace />}
+        />
+        <Route
+          path="models"
+          element={isAdmin ? <ModelsPage /> : <Navigate to="/" replace />}
+        />
+        <Route
+          path="providers"
+          element={isAdmin ? <ProvidersPage /> : <Navigate to="/" replace />}
+        />
+        <Route
+          path="pricing"
+          element={isAdmin ? <PricingPage /> : <Navigate to="/" replace />}
+        />
+      </Route>
+    </Routes>
+  );
+}
+
 export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route element={<Layout />}>
-        <Route index element={<DashboardPage />} />
-        <Route path="config" element={<ConfigPage />} />
-      </Route>
+      <Route path="/*" element={<AuthedApp />} />
     </Routes>
   );
 }

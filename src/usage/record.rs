@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use super::source::UsageSource;
 use crate::model::Protocol;
@@ -11,6 +12,10 @@ pub(crate) struct UsageRecord {
     pub provider_id: String,
     pub protocol: Protocol,
     pub path: String,
+    /// Caller attribution; `None` only for records produced before accounts
+    /// existed (historical rows) or by unauthenticated gateway-owned paths.
+    pub user_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
     pub requested_model: Option<String>,
     pub upstream_model: Option<String>,
     pub status: u16,

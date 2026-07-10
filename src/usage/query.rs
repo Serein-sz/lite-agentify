@@ -3,6 +3,7 @@ use std::{future::Future, pin::Pin};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
+use uuid::Uuid;
 
 pub(crate) type UsageQueryFuture<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
 
@@ -33,6 +34,10 @@ pub(crate) struct UsageListParams {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub status: Option<StatusFilter>,
+    /// Attribution filters. For `user`-role callers the API layer forces
+    /// `user_id` to the session user, making the scope non-bypassable.
+    pub user_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
     /// 1-based page index.
     pub page: u64,
     pub page_size: u64,
@@ -45,6 +50,8 @@ pub(crate) struct UsageRow {
     pub provider_id: String,
     pub protocol: String,
     pub path: String,
+    pub user_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
     pub requested_model: Option<String>,
     pub upstream_model: Option<String>,
     pub status: u16,
@@ -77,6 +84,8 @@ pub(crate) struct UsageSummaryParams {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
     pub bucket: SummaryBucket,
+    /// When set, every aggregate covers only rows attributed to this user.
+    pub user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

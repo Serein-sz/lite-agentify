@@ -76,50 +76,115 @@ export interface UsageListResponse {
   page_size: number;
 }
 
-export interface ConfigPayload {
-  content: string;
-  hash: string;
-}
-
-/** 结构化配置 DTO,与后端 `StructuredConfig` 一致;密钥字段可携带 __MASKED__ 哨兵。 */
-export interface StructuredProvider {
+export interface ProviderRecord {
   id: string;
   protocol: string;
   base_url: string;
+  /** Masked (`__MASKED__…`) in list/read responses. */
   api_key: string;
-  anthropic_version?: string;
+  anthropic_version: string | null;
   model_aliases: Record<string, string>;
 }
 
-export interface StructuredRoute {
-  path_prefix: string;
-  providers: string[];
-  model_prefix?: string;
+export interface DeploymentRecord {
+  id: string;
+  provider_id: string;
+  upstream_model: string;
 }
 
-/** 单价字段为字符串,后端按原文写入 TOML 以保留精度。 */
-export interface StructuredPricing {
+export interface ModelRecord {
+  name: string;
+  enabled: boolean;
+  created_at: string;
+  deployments: DeploymentRecord[];
+  /** `provider:upstream_model` pairs missing a pricing rule. */
+  uncovered: string[];
+}
+
+export interface PricingRecord {
+  id: string;
   provider: string;
   model: string;
   input_per_1m: string;
   output_per_1m: string;
-  cached_input_per_1m?: string;
-  cache_read_per_1m?: string;
-  cache_write_per_1m?: string;
+  cached_input_per_1m: string | null;
+  cache_read_per_1m: string | null;
+  cache_write_per_1m: string | null;
   currency: string;
-  pricing_source?: string;
-}
-
-export interface StructuredConfig {
-  gateway_keys: string[];
-  providers: StructuredProvider[];
-  routes: StructuredRoute[];
-  pricing: StructuredPricing[];
+  pricing_source: string | null;
 }
 
 export interface SaveResult {
   message: string;
   warnings: string[];
+}
+
+export type Role = "admin" | "user";
+
+export interface Me {
+  user_id: string;
+  username: string;
+  role: Role;
+}
+
+export interface UserRecord {
+  id: string;
+  username: string;
+  role: Role;
+  status: "active" | "disabled";
+  created_at: string;
+}
+
+export interface ApiKeyRecord {
+  id: string;
+  user_id: string;
+  prefix: string;
+  name: string;
+  status: "active" | "revoked";
+  created_at: string;
+  last_used_at: string | null;
+  /** Model names this key may call; null = every enabled model. */
+  allowed_models: string[] | null;
+  /** Cumulative USD spend cap; null = uncapped. Decimal as string. */
+  spend_cap_usd: string | null;
+  /** Cumulative USD spent through this key (live counter), when available. */
+  spent_usd?: string | null;
+  /** Present only in the admin all-keys listing. */
+  username?: string;
+}
+
+export interface CreatedKey {
+  /** The plaintext key, shown exactly once. */
+  key: string;
+  record: ApiKeyRecord;
+  warning?: string;
+}
+
+/** Own credit position: Σ grants, Σ usage cost, and their difference. */
+export interface BalanceSummary {
+  granted: string;
+  spent: string;
+  balance: string;
+}
+
+export interface UserBalance {
+  user_id: string;
+  username: string;
+  status: "active" | "disabled";
+  granted: string;
+  spent: string;
+  balance: string;
+}
+
+export interface GrantRow {
+  id: string;
+  user_id: string;
+  username: string | null;
+  /** Positive = grant, negative = correction. Decimal as string. */
+  amount_usd: string;
+  note: string | null;
+  granted_by: string | null;
+  created_at: string;
 }
 
 interface RequestOptions {
@@ -159,28 +224,125 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 }
 
 export const api = {
-  login: (password: string) =>
-    request<{ ok: boolean }>("/login", {
+  login: (username: string, password: string) =>
+    request<{ ok: boolean; username: string; role: Role }>("/login", {
       method: "POST",
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ username, password }),
       redirectOn401: false,
     }),
   logout: () => request<{ ok: boolean }>("/logout", { method: "POST" }),
-  getConfig: () => request<ConfigPayload>("/config"),
-  putConfig: (content: string, baseHash: string) =>
-    request<SaveResult>("/config", {
-      method: "PUT",
-      body: JSON.stringify({ content, base_hash: baseHash }),
-    }),
-  putConfigStructured: (config: StructuredConfig, baseHash: string) =>
-    request<SaveResult>("/config/structured", {
-      method: "PUT",
-      body: JSON.stringify({ config, base_hash: baseHash }),
-    }),
-  revealSecret: (field: string) =>
-    request<{ value: string }>("/config/reveal", {
+  me: () => request<Me>("/me", { redirectOn401: false }),
+  changeOwnPassword: (currentPassword: string, newPassword: string) =>
+    request<{ ok: boolean }>("/me/password", {
       method: "POST",
-      body: JSON.stringify({ field }),
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    }),
+  listUsers: () => request<{ users: UserRecord[] }>("/users"),
+  createUser: (username: string, password: string, role: Role) =>
+    request<{ user: UserRecord }>("/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password, role }),
+    }),
+  disableUser: (id: string) =>
+    request<{ ok: boolean }>(`/users/${id}/disable`, { method: "POST" }),
+  enableUser: (id: string) =>
+    request<{ ok: boolean }>(`/users/${id}/enable`, { method: "POST" }),
+  resetUserPassword: (id: string, password: string) =>
+    request<{ ok: boolean }>(`/users/${id}/reset-password`, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }),
+  listKeys: () => request<{ keys: ApiKeyRecord[] }>("/keys"),
+  createKey: (name: string, allowedModels: string[] | null, spendCapUsd: string | null) =>
+    request<CreatedKey>("/keys", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        allowed_models: allowedModels,
+        spend_cap_usd: spendCapUsd,
+      }),
+    }),
+  updateKey: (id: string, allowedModels: string[] | null, spendCapUsd: string | null) =>
+    request<{ ok: boolean }>(`/keys/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        allowed_models: allowedModels,
+        spend_cap_usd: spendCapUsd,
+      }),
+    }),
+  revokeKey: (id: string) =>
+    request<{ ok: boolean }>(`/keys/${id}/revoke`, { method: "POST" }),
+  myBalance: () => request<BalanceSummary>("/me/balance"),
+  listBalances: () => request<{ balances: UserBalance[] }>("/credits"),
+  createGrant: (userId: string, amountUsd: string, note: string | null) =>
+    request<{ warning?: string }>("/credits/grants", {
+      method: "POST",
+      body: JSON.stringify({ user_id: userId, amount_usd: amountUsd, note }),
+    }),
+  listLedger: (userId?: string, limit = 200) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (userId) params.set("user_id", userId);
+    return request<{ grants: GrantRow[] }>(`/credits/ledger?${params.toString()}`);
+  },
+  listProviders: () => request<{ providers: ProviderRecord[] }>("/providers"),
+  createProvider: (provider: Omit<ProviderRecord, "id"> & { id: string }) =>
+    request<{ ok: boolean }>("/providers", {
+      method: "POST",
+      body: JSON.stringify(provider),
+    }),
+  updateProvider: (id: string, provider: Omit<ProviderRecord, "id">) =>
+    request<{ ok: boolean; warning?: string }>(`/providers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(provider),
+    }),
+  deleteProvider: (id: string) =>
+    request<{ ok: boolean }>(`/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  revealProviderKey: (id: string) =>
+    request<{ value: string }>(`/providers/${encodeURIComponent(id)}/reveal`, {
+      method: "POST",
+    }),
+  listPricing: () => request<{ pricing: PricingRecord[] }>("/pricing"),
+  createPricing: (pricing: Omit<PricingRecord, "id">) =>
+    request<{ ok: boolean }>("/pricing", {
+      method: "POST",
+      body: JSON.stringify(pricing),
+    }),
+  updatePricing: (id: string, pricing: Omit<PricingRecord, "id">) =>
+    request<{ ok: boolean }>(`/pricing/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(pricing),
+    }),
+  deletePricing: (id: string) =>
+    request<{ ok: boolean }>(`/pricing/${id}`, { method: "DELETE" }),
+  listModels: () => request<{ models: ModelRecord[] }>("/models"),
+  /** Enabled model names; readable by every signed-in user (key editor picker). */
+  listModelNames: () => request<{ models: string[] }>("/models/names"),
+  createModel: (
+    name: string,
+    deployments: { provider_id: string; upstream_model: string }[],
+    enabled: boolean,
+  ) =>
+    request<{ ok: boolean; warning?: string }>("/models", {
+      method: "POST",
+      body: JSON.stringify({ name, deployments, enabled }),
+    }),
+  updateModel: (
+    name: string,
+    deployments: { provider_id: string; upstream_model: string }[],
+    enabled: boolean,
+  ) =>
+    request<{ ok: boolean; warning?: string }>(`/models/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ deployments, enabled }),
+    }),
+  deleteModel: (name: string) =>
+    request<{ ok: boolean }>(`/models/${encodeURIComponent(name)}`, {
+      method: "DELETE",
     }),
   usageSummary: (params: URLSearchParams) =>
     request<UsageSummaryResponse>(`/usage/summary?${params.toString()}`),
