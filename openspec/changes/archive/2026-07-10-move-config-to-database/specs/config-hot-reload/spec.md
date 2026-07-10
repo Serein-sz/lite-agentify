@@ -1,19 +1,15 @@
-# config-hot-reload Specification
+# config-hot-reload Specification (delta)
 
-## Purpose
-
-Reload gateway configuration at runtime without restarting the process: atomic snapshot swap, file-watch and endpoint triggers, keep-previous-config failure semantics, and warnings for non-reloadable fields.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Gateway reloads configuration without restart
 
-The system SHALL support reloading the gateway configuration file at runtime and SHALL apply reloaded retry configuration to subsequent requests without restarting the gateway process. Providers, pricing, models, users, and API keys live in the database and take effect through snapshot rebuilds triggered by their management APIs, not file reload.
+The system SHALL support reloading the gateway configuration file at runtime and SHALL apply reloaded route and retry configuration to subsequent requests without restarting the gateway process. Provider, pricing, user, and API key configuration live in the database and take effect through snapshot rebuilds triggered by their management APIs, not file reload; a file reload MUST still re-validate routes against the current database providers.
 
-#### Scenario: Reloaded retry configuration serves subsequent requests
+#### Scenario: Reloaded route configuration serves subsequent requests
 
-- **WHEN** the gateway configuration file is modified to change `retry` settings and a reload completes successfully
-- **THEN** the gateway MUST apply the reloaded retry policy to subsequent requests.
+- **WHEN** the gateway configuration file is modified to change route or retry settings and a reload completes successfully
+- **THEN** the gateway MUST route and process subsequent requests using the reloaded configuration.
 
 #### Scenario: In-flight requests are unaffected by reload
 
@@ -22,7 +18,7 @@ The system SHALL support reloading the gateway configuration file at runtime and
 
 #### Scenario: Database mutation refreshes the snapshot without file reload
 
-- **WHEN** an admin mutates providers, pricing, models, users, or API keys through the management APIs
+- **WHEN** an admin mutates providers, pricing, users, or API keys through the management APIs
 - **THEN** the gateway MUST rebuild and atomically swap the snapshot without requiring a config file change.
 
 ### Requirement: Gateway keeps serving with previous configuration when reload fails
@@ -58,25 +54,6 @@ The system SHALL NOT apply changes to the listen address or database connection 
 - **WHEN** a reload is triggered and the configuration file changes the `database` configuration
 - **THEN** the gateway MUST keep the existing database connection, MUST log a warning that the change requires a restart, and MUST apply the other reloadable configuration changes.
 
-### Requirement: Gateway watches the configuration file for changes
-
-The system SHALL watch the configuration file for modifications using a cross-platform file notification mechanism and SHALL trigger a reload when the file changes. The system SHALL debounce rapid successive file events into a single reload attempt.
-
-#### Scenario: Saving the configuration file triggers a reload
-
-- **WHEN** the configuration file is modified on disk while the gateway is running
-- **THEN** the gateway MUST attempt a configuration reload without manual intervention.
-
-#### Scenario: Rapid successive writes are debounced
-
-- **WHEN** the configuration file receives multiple write events within the debounce window (for example an editor writing a temporary file and renaming it)
-- **THEN** the gateway MUST coalesce them into a single reload attempt.
-
-#### Scenario: Watcher failure does not affect proxying
-
-- **WHEN** the file watcher cannot be created or stops delivering events
-- **THEN** the gateway MUST log the watcher failure and MUST continue serving proxy traffic, and manual reload via the reload endpoint MUST remain available.
-
 ### Requirement: Gateway exposes an authenticated reload endpoint
 
 The system SHALL expose a `POST /reload` endpoint that requires API key authentication, triggers a configuration reload, and reports the reload outcome in the response.
@@ -95,3 +72,9 @@ The system SHALL expose a `POST /reload` endpoint that requires API key authenti
 
 - **WHEN** a client sends `POST /reload` without a valid API key
 - **THEN** the gateway MUST reject the request and MUST NOT trigger a reload.
+
+## REMOVED Requirements
+
+### Requirement: Gateway key changes take effect on reload
+**Reason**: Static `gateway_keys` were replaced by database-backed API keys in `add-user-account-system`; key changes take effect through snapshot rebuilds triggered by the key management API, not file reload.
+**Migration**: Create and revoke keys through `/admin/api/keys`; no file edit or reload is involved.

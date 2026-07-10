@@ -1,9 +1,20 @@
-# admin-usage Specification
+# admin-usage Specification (delta)
 
-## Purpose
-TBD - created by syncing change add-admin-ui. Update Purpose after archive.
+## ADDED Requirements
 
-## Requirements
+### Requirement: Usage rows are attributed to a user and API key
+The system SHALL persist the authenticated user id and API key id on every usage record created after this change, and SHALL treat rows with NULL attribution as pre-accounts history.
+
+#### Scenario: New usage row carries attribution
+- **WHEN** an authenticated proxied request completes and a usage record is written
+- **THEN** the record MUST contain the user id and API key id that made the request.
+
+#### Scenario: Historical rows remain readable
+- **WHEN** usage queries cover rows written before this change
+- **THEN** those rows MUST be returned with empty attribution rather than being excluded or causing errors.
+
+## MODIFIED Requirements
+
 ### Requirement: Usage log is queryable with pagination and filters
 The system SHALL serve `GET /admin/api/usage` returning recorded usage rows ordered by `created_at` descending, with `page`/`page_size` pagination (`page_size` capped at 200) and a total row count, filterable by time range (`from`/`to`), `provider`, `model`, and status (exact code or `4xx`/`5xx` class). For `admin`-role sessions the endpoint SHALL additionally filter by `user` and `api_key`; for `user`-role sessions the endpoint SHALL return only rows attributed to the session's user.
 
@@ -38,13 +49,8 @@ The system SHALL serve `GET /admin/api/usage/summary` for a time range, returnin
 - **WHEN** a `user`-role session requests the summary
 - **THEN** all totals, series, and breakdowns MUST cover only rows attributed to that user.
 
-### Requirement: Usage rows are attributed to a user and API key
-The system SHALL persist the authenticated user id and API key id on every usage record created after this change, and SHALL treat rows with NULL attribution as pre-accounts history.
+## REMOVED Requirements
 
-#### Scenario: New usage row carries attribution
-- **WHEN** an authenticated proxied request completes and a usage record is written
-- **THEN** the record MUST contain the user id and API key id that made the request.
-
-#### Scenario: Historical rows remain readable
-- **WHEN** usage queries cover rows written before this change
-- **THEN** those rows MUST be returned with empty attribution rather than being excluded or causing errors.
+### Requirement: Disabled usage recording degrades gracefully
+**Reason**: PostgreSQL is now a mandatory dependency and usage recording is always enabled; the "no usage database" state no longer exists.
+**Migration**: Deployments that ran without `usage_database` must provision PostgreSQL before upgrading (see `user-accounts`). The `usage_enabled: false` response shape is retired.

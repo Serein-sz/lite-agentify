@@ -4,14 +4,14 @@
 TBD - created by archiving change add-llm-gateway-mvp. Update Purpose after archive.
 ## Requirements
 ### Requirement: Gateway authenticates client requests
-The system SHALL require configured gateway bearer token authentication for provider pass-through endpoints.
+The system SHALL require API key authentication for provider pass-through endpoints, resolving the presented bearer token against database-backed API keys via an in-process snapshot keyed by SHA-256 hash. Requests presenting a key that is revoked, or whose owning user is disabled, MUST be rejected.
 
 #### Scenario: Request with valid gateway key is accepted
-- **WHEN** a client sends a provider pass-through request with `Authorization: Bearer <configured-gateway-key>`
-- **THEN** the gateway MUST continue request routing and proxy processing.
+- **WHEN** a client sends a provider pass-through request with `Authorization: Bearer <active-api-key>` belonging to an active user
+- **THEN** the gateway MUST continue request routing and proxy processing, attributing the request to the key's owning user.
 
 #### Scenario: Request without valid gateway key is rejected
-- **WHEN** a client sends a provider pass-through request without a configured gateway bearer token
+- **WHEN** a client sends a provider pass-through request without a valid API key, or with a revoked key, or with a key whose owning user is disabled
 - **THEN** the gateway MUST reject the request before contacting any upstream provider.
 
 ### Requirement: Gateway separates upstream credentials from client credentials
@@ -25,42 +25,16 @@ The system SHALL use configured upstream provider credentials when forwarding re
 - **WHEN** an authenticated client sends an Anthropic-compatible pass-through request
 - **THEN** the gateway MUST send the configured Anthropic upstream credential and required Anthropic version header to the matched provider.
 
-### Requirement: Gateway routes OpenAI-compatible requests by configured route rules
-The system SHALL route OpenAI-compatible paths to configured OpenAI-compatible provider chains without changing the OpenAI-compatible request or response schema.
-
-#### Scenario: Chat completions request matches OpenAI-compatible route
-- **WHEN** an authenticated client sends `POST /v1/chat/completions` and a configured route matches that path
-- **THEN** the gateway MUST forward the request body to the first available OpenAI-compatible provider in the matched route's chain.
-
-#### Scenario: Responses request matches OpenAI-compatible route
-- **WHEN** an authenticated client sends `POST /v1/responses` and a configured route matches that path
-- **THEN** the gateway MUST forward the request body to the first available OpenAI-compatible provider in the matched route's chain.
-
-#### Scenario: Models request matches OpenAI-compatible route
-- **WHEN** an authenticated client sends `GET /v1/models` and a configured OpenAI-compatible route matches that path
-- **THEN** the gateway MUST forward the request to the first available OpenAI-compatible provider in the matched route's chain.
-
-### Requirement: Gateway routes Anthropic-compatible requests by configured route rules
-The system SHALL route Anthropic-compatible paths to configured Anthropic-compatible provider chains without changing the Anthropic-compatible request or response schema.
-
-#### Scenario: Messages request matches Anthropic-compatible route
-- **WHEN** an authenticated client sends `POST /v1/messages` and a configured route matches that path
-- **THEN** the gateway MUST forward the request body to the first available Anthropic-compatible provider in the matched route's chain.
-
-#### Scenario: Models request matches Anthropic-compatible route
-- **WHEN** an authenticated client sends `GET /v1/models` and a configured Anthropic-compatible route matches that path
-- **THEN** the gateway MUST forward the request to the first available Anthropic-compatible provider in the matched route's chain.
-
 ### Requirement: Gateway does not convert between provider protocols
-The system MUST preserve protocol-native request and response formats and MUST NOT translate OpenAI-compatible requests into Anthropic-compatible requests or Anthropic-compatible requests into OpenAI-compatible requests.
+The system MUST preserve protocol-native request and response formats and MUST NOT translate OpenAI-compatible requests into Anthropic-compatible requests or Anthropic-compatible requests into OpenAI-compatible requests. Deployment chains are filtered to the request endpoint's protocol family rather than translated.
 
 #### Scenario: OpenAI-compatible request never falls through to Anthropic conversion
-- **WHEN** an authenticated OpenAI-compatible request has no matching OpenAI-compatible route
-- **THEN** the gateway MUST return a route error instead of converting the request to Anthropic-compatible format.
+- **WHEN** an authenticated OpenAI-compatible request resolves to a model whose only deployments are Anthropic-protocol providers
+- **THEN** the gateway MUST return a resolution error instead of converting the request to Anthropic-compatible format.
 
 #### Scenario: Anthropic-compatible request never falls through to OpenAI conversion
-- **WHEN** an authenticated Anthropic-compatible request has no matching Anthropic-compatible route
-- **THEN** the gateway MUST return a route error instead of converting the request to OpenAI-compatible format.
+- **WHEN** an authenticated Anthropic-compatible request resolves to a model whose only deployments are OpenAI-protocol providers
+- **THEN** the gateway MUST return a resolution error instead of converting the request to OpenAI-compatible format.
 
 ### Requirement: Gateway preserves provider-native streaming responses
 The system SHALL proxy streaming responses from upstream providers without rewriting provider-native stream events.
@@ -81,34 +55,34 @@ The system SHALL expose a gateway-owned health endpoint that does not require pr
 - **THEN** the gateway MUST return a successful response when the HTTP service is running.
 
 ### Requirement: Gateway records request metadata
-The system SHALL record operational metadata for provider pass-through requests without logging prompt or completion bodies by default.
+The system SHALL record operational metadata for provider pass-through requests without logging prompt or completion bodies by default, including the authenticated user id and API key id for every proxied request.
 
 #### Scenario: Completed provider request records metadata
 - **WHEN** a provider pass-through request completes
-- **THEN** the gateway MUST record request id, provider id, protocol, path, response status, and latency.
+- **THEN** the gateway MUST record request id, provider id, protocol, path, response status, latency, and the user id and API key id that made the request.
 
 #### Scenario: Prompt body is not logged by default
 - **WHEN** a provider pass-through request includes prompt or message content
 - **THEN** the gateway MUST NOT log the full request body by default.
 
 ### Requirement: Gateway routes support an ordered provider failover chain
-The system SHALL allow a route to reference an ordered list of providers, where list order expresses priority, and SHALL attempt providers in that order until one returns a non-failover response or the chain is exhausted.
+The system SHALL attempt a resolved model's protocol-filtered deployments in catalog order, where order expresses priority, until one returns a non-failover response or the chain is exhausted.
 
 #### Scenario: Primary provider success skips fallback providers
-- **WHEN** an authenticated request matches a route whose provider chain is `[primary, fallback]` and the primary returns a non-failover response
+- **WHEN** an authenticated request resolves to a deployment chain `[primary, fallback]` and the primary returns a non-failover response
 - **THEN** the gateway MUST forward the primary response to the client and MUST NOT contact the fallback provider.
 
 #### Scenario: Primary transport failure falls over to next provider
-- **WHEN** an authenticated request matches a route whose provider chain is `[primary, fallback]` and the primary request fails with a transport error
-- **THEN** the gateway MUST retry the same request against the fallback provider and forward the fallback response.
+- **WHEN** an authenticated request resolves to a deployment chain `[primary, fallback]` and the primary request fails with a transport error
+- **THEN** the gateway MUST retry the same request against the fallback deployment and forward the fallback response.
 
 #### Scenario: Primary 5xx response falls over to next provider
-- **WHEN** an authenticated request matches a route whose provider chain is `[primary, fallback]` and the primary returns an HTTP 5xx status
-- **THEN** the gateway MUST retry the same request against the fallback provider and forward the fallback response.
+- **WHEN** an authenticated request resolves to a deployment chain `[primary, fallback]` and the primary returns an HTTP 5xx status
+- **THEN** the gateway MUST retry the same request against the fallback deployment and forward the fallback response.
 
 #### Scenario: Exhausted failover chain returns a gateway error
-- **WHEN** an authenticated request matches a route and every provider in the chain fails with a transport error or HTTP 5xx status
-- **THEN** the gateway MUST return a gateway error response after the last provider attempt.
+- **WHEN** every deployment in the resolved chain fails with a transport error or HTTP 5xx status
+- **THEN** the gateway MUST return a gateway error response after the last attempt.
 
 ### Requirement: Gateway retries rate-limited providers with bounded backoff before failing over
 The system SHALL treat a configurable set of upstream statuses (default HTTP 429 and 529) as retryable, and on such a response SHALL wait a bounded backoff delay and retry the **same** provider up to a configured maximum number of attempts before advancing to the next provider in the failover chain. The retryable-status check takes precedence, so a status that is both a server error and in the retryable set (e.g. HTTP 529) is retried rather than failed over. All other HTTP 2xx, 3xx, and non-retryable 4xx responses MUST be forwarded to the client immediately without retry or failover. Transport errors and non-retryable HTTP 5xx responses MUST fail over to the next provider immediately without same-provider retry.
@@ -153,59 +127,15 @@ The system SHALL determine whether to fail over based on the upstream response s
 - **WHEN** an authenticated request that expects a streaming response matches a route with a failover chain
 - **THEN** the gateway MUST select the responding provider based on status before streaming body bytes, and once body bytes are forwarded MUST NOT switch providers.
 
-### Requirement: Gateway validates failover chain consistency at startup
-The system SHALL validate each route's provider chain at startup, requiring a non-empty chain of existing providers that all share one protocol.
-
-#### Scenario: Route with a mixed-protocol chain is rejected
-- **WHEN** a route's provider chain references providers configured with different protocols
-- **THEN** the gateway MUST fail startup with a configuration error.
-
-#### Scenario: Route with an empty provider chain is rejected
-- **WHEN** a route is configured with an empty provider chain
-- **THEN** the gateway MUST fail startup with a configuration error.
-
-### Requirement: Gateway resolves provider-specific model aliases
-The system SHALL allow each provider to define model aliases that map public client-facing model names to provider-specific upstream model names.
-
-#### Scenario: Request model is rewritten for the selected provider
-- **WHEN** an authenticated client sends a provider pass-through request whose top-level `model` value matches an alias configured for the selected provider
-- **THEN** the gateway MUST forward the request to that provider with the top-level `model` value replaced by the configured upstream model name.
-
-#### Scenario: Fallback provider receives its own mapped model
-- **WHEN** an authenticated request matches a route with a failover chain and the gateway attempts a fallback provider after the primary fails
-- **THEN** the gateway MUST resolve the original client-facing model name against the fallback provider's aliases before forwarding the fallback request.
-
-### Requirement: Gateway preserves existing model pass-through when aliases are absent
-The system SHALL preserve current provider pass-through behavior for providers that do not configure model aliases.
-
-#### Scenario: Provider without aliases receives original model
-- **WHEN** an authenticated client sends a provider pass-through request to a matched route and the selected provider has no model aliases configured
-- **THEN** the gateway MUST forward the request body without changing the top-level `model` value.
-
-### Requirement: Gateway does not expose unresolved upstream model names through alias-enabled providers
-The system SHALL NOT forward a request to a provider with configured model aliases unless the request's top-level `model` value resolves through that provider's alias map.
-
-#### Scenario: Provider without requested alias is skipped before upstream contact
-- **WHEN** an authenticated request matches a route and a provider in the route chain has model aliases configured but does not define the requested model alias
-- **THEN** the gateway MUST NOT contact that provider for the request.
-
-#### Scenario: Later provider can serve requested alias
-- **WHEN** an authenticated request matches a route whose first provider cannot resolve the requested model alias and a later provider can resolve it
-- **THEN** the gateway MUST forward the request to the later provider with that provider's configured upstream model name.
-
-#### Scenario: No provider can resolve requested alias
-- **WHEN** an authenticated request matches a route but every alias-enabled provider in the route chain lacks the requested model alias
-- **THEN** the gateway MUST return a gateway error without contacting those providers.
-
 ### Requirement: Gateway limits alias rewriting to protocol-native model fields
-The system SHALL only rewrite the top-level string `model` field in JSON request bodies and MUST NOT otherwise transform protocol-native request or response schemas.
+The system SHALL only rewrite the top-level string `model` field in JSON request bodies — replacing the public catalog name with the attempted deployment's upstream model name — and MUST NOT otherwise transform protocol-native request or response schemas.
 
 #### Scenario: Only top-level model field changes
-- **WHEN** an authenticated request body contains a top-level string `model` value that resolves through the selected provider's aliases
+- **WHEN** an authenticated request body contains a top-level string `model` value resolved through the catalog
 - **THEN** the gateway MUST preserve all other request body fields unchanged when forwarding upstream.
 
 #### Scenario: Responses remain provider-native
-- **WHEN** an upstream provider returns a response to a request that used model alias resolution
+- **WHEN** an upstream provider returns a response to a request whose model was rewritten to the deployment's upstream name
 - **THEN** the gateway MUST forward the provider-native response without rewriting response body model fields.
 
 ### Requirement: Gateway records token usage and estimated cost
@@ -266,27 +196,23 @@ The system SHALL observe provider-native streaming responses for usage metadata 
 - **THEN** the gateway MUST preserve the client stream and persist request metadata with usage source unavailable.
 
 ### Requirement: Gateway configures usage persistence and pricing externally
-The system SHALL read usage database connectivity and provider/model pricing from gateway configuration.
+The system SHALL read database connectivity from gateway configuration (the mandatory `database` section) and provider/model pricing from the database's pricing rules. The gateway MUST NOT rely on hard-coded provider model prices.
 
-#### Scenario: Usage database configuration is absent
-- **WHEN** the gateway starts without usage database configuration
-- **THEN** the gateway MUST start with usage persistence disabled and continue proxying provider requests.
+#### Scenario: Database configuration is required
+- **WHEN** the gateway starts
+- **THEN** it MUST initialize PostgreSQL persistence through SeaORM using the configured `database` section, and MUST fail startup when it is absent or unreachable.
 
-#### Scenario: Usage database configuration is enabled
-- **WHEN** the gateway starts with enabled usage database configuration
-- **THEN** the gateway MUST initialize PostgreSQL persistence through SeaORM for usage records.
-
-#### Scenario: Pricing configuration is loaded
-- **WHEN** the gateway configuration contains pricing entries
-- **THEN** the gateway MUST use those entries for cost estimation and MUST NOT rely on hard-coded provider model prices.
+#### Scenario: Pricing rules are loaded from the database
+- **WHEN** the gateway builds its snapshot and pricing rules exist in the database
+- **THEN** it MUST use those rules for cost estimation and MUST NOT rely on hard-coded provider model prices.
 
 #### Scenario: Pricing falls back through explicit wildcards
-- **WHEN** no exact pricing entry matches the selected provider id and upstream model
+- **WHEN** no exact pricing rule matches the selected provider id and upstream model
 - **THEN** the gateway MUST look for pricing in this order: selected provider id with `*` model, `*` provider with upstream model, and `*` provider with `*` model.
 
-#### Scenario: Example usage configuration is documented
+#### Scenario: Example configuration is documented
 - **WHEN** a user reviews the gateway configuration documentation or sample configuration
-- **THEN** the system MUST include commented examples for PostgreSQL usage database settings and provider/model pricing fields.
+- **THEN** the system MUST include examples for the PostgreSQL `database` section and document that pricing is managed through the admin console or API.
 
 ### Requirement: Gateway protects request and response content in usage records
 The system SHALL NOT persist prompt, message, or completion content as part of usage recording.
