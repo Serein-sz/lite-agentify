@@ -261,10 +261,22 @@ fn event_touches_config(
     event: &Result<notify::Event, notify::Error>,
     file_name: &std::ffi::OsStr,
 ) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind};
+
     match event {
         // Events without paths cannot be attributed; treat them as relevant so
         // a reload attempt is never missed (a spurious reload is harmless).
         Ok(event) => {
+            match event.kind {
+                // Close-after-write is the canonical "editor saved the file
+                // in place" signal; keep it.
+                EventKind::Access(AccessKind::Close(AccessMode::Write)) => {}
+                // Other access events (open/read/close-nowrite) fire on mere
+                // reads. The reload itself reads the config file, so reacting
+                // to reads would re-trigger the watcher forever.
+                EventKind::Access(_) => return false,
+                _ => {}
+            }
             event.paths.is_empty()
                 || event
                     .paths
@@ -272,5 +284,64 @@ fn event_touches_config(
                     .any(|path| path.file_name() == Some(file_name))
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind,
+    };
+
+    fn event(kind: EventKind, path: Option<&str>) -> Result<notify::Event, notify::Error> {
+        let mut event = notify::Event::new(kind);
+        if let Some(path) = path {
+            event = event.add_path(std::path::PathBuf::from(path));
+        }
+        Ok(event)
+    }
+
+    /// Reads of the config file (open/read/close-nowrite) must not trigger a
+    /// reload: the reload itself reads the file, so reacting to read events
+    /// would re-trigger the watcher in a 500ms loop forever.
+    #[test]
+    fn read_access_events_are_ignored() {
+        let name = std::ffi::OsStr::new("gateway.toml");
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            assert!(
+                !event_touches_config(&event(kind, Some("/etc/gateway.toml")), name),
+                "{kind:?} is a read and must not trigger a reload"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_saves_and_unattributable_events_still_trigger() {
+        let name = std::ffi::OsStr::new("gateway.toml");
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Create(CreateKind::File),
+        ] {
+            assert!(
+                event_touches_config(&event(kind, Some("/etc/gateway.toml")), name),
+                "{kind:?} changes the file and must trigger a reload"
+            );
+        }
+        // Events without paths cannot be attributed and stay relevant.
+        assert!(event_touches_config(&event(EventKind::Other, None), name));
+        // Changes to sibling files stay irrelevant.
+        assert!(!event_touches_config(
+            &event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                Some("/etc/other.toml")
+            ),
+            name
+        ));
     }
 }
